@@ -65,13 +65,6 @@ Panel {
   function finishRefresh() {
     loading = false
     var body = fetchStdout.text
-    console.warn("[hari.comics] fetched bytes:", body ? body.length : 0, "parsed:", Model.parseReleases(body).length)
-    var parsed = Model.parseReleases(body)
-
-  function finishRefresh() {
-    loading = false
-    var body = fetchStdout.text
-    console.log("[hari.comics] fetched bytes:", body ? body.length : 0, "parsed:", Model.parseReleases(body).length)
     var parsed = Model.parseReleases(body)
     if (parsed.length > 0 || fetchExitCode === 0) {
       issues = parsed
@@ -100,7 +93,9 @@ Panel {
     running: true
     repeat: true
     triggeredOnStart: true
-    onTriggered: root.startRefresh()
+    onTriggered: {
+      root.startRefresh()
+    }
   }
 
   Process {
