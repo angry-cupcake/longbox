@@ -1,0 +1,76 @@
+{
+  "schemaVersion": 1,
+  "id": "hari.comics",
+  "name": "Comic Releases",
+  "version": "0.1.0",
+  "author": "hari",
+  "license": "MIT",
+  "description": "League of Comic Geeks pull list and weekly releases in your bar.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Comic Releases",
+    "description": "Your League of Comic Geeks pull list (or the weekly release sheet) with cover art, prices, and release dates.",
+    "category": "Media",
+    "aliases": [
+      "comics",
+      "pull-list",
+      "comicgeeks"
+    ],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "username": "cupcakeisangry",
+      "source": "pulls",
+      "excludeVariants": true,
+      "showCovers": true,
+      "refreshIntervalMin": 60
+    },
+    "schema": [
+      {
+        "key": "username",
+        "type": "string",
+        "label": "League of Comic Geeks username",
+        "description": "Your LoCG profile name. Pull lists are public, so no login needed. Leave blank to track the general weekly releases instead.",
+        "defaultValue": "cupcakeisangry"
+      },
+      {
+        "key": "source",
+        "type": "list",
+        "label": "Source",
+        "description": "Pull list shows your tracked comics; Releases shows everything shipping this week.",
+        "defaultValue": "pulls",
+        "options": [
+          { "value": "pulls", "label": "My pull list" },
+          { "value": "releases", "label": "All weekly releases" }
+        ]
+      },
+      {
+        "key": "excludeVariants",
+        "type": "boolean",
+        "label": "Hide variant covers",
+        "description": "Only applies to the weekly releases source.",
+        "defaultValue": true
+      },
+      {
+        "key": "showCovers",
+        "type": "boolean",
+        "label": "Show cover art",
+        "defaultValue": true
+      },
+      {
+        "key": "refreshIntervalMin",
+        "type": "integer",
+        "label": "Refresh interval (minutes)",
+        "min": 10,
+        "max": 720,
+        "step": 10,
+        "defaultValue": 60
+      }
+    ]
+  }
+}
