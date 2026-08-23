@@ -4,7 +4,7 @@ import qs.Ui
 
 BarWidget {
   id: root
-  moduleName: "hari.comics"
+  moduleName: "angry-cupcake.longbox"
 
   readonly property bool opened: panelLoader.item
     ? panelLoader.item.opened === true
@@ -61,7 +61,7 @@ BarWidget {
       var count = panelLoader.item.barCount
       return count !== "" ? "\uf02d " + count : "\uf02d"
     }
-    tooltipText: panelLoader.item ? panelLoader.item.barTooltip : "Comic releases"
+    tooltipText: panelLoader.item ? panelLoader.item.barTooltip : "Longbox"
     onPressed: function(buttonCode) {
       if (buttonCode === Qt.LeftButton) root.toggle()
       else if (buttonCode === Qt.RightButton && panelLoader.item)

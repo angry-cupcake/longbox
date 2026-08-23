@@ -1,11 +1,11 @@
 {
   "schemaVersion": 1,
-  "id": "hari.comics",
-  "name": "Comic Releases",
-  "version": "0.1.0",
-  "author": "hari",
+  "id": "angry-cupcake.longbox",
+  "name": "Longbox",
+  "version": "0.2.0",
+  "author": "angry-cupcake",
   "license": "MIT",
-  "description": "League of Comic Geeks pull list and weekly releases in your bar.",
+  "description": "Your comic pull list and the weekly release sheet, right in your bar.",
   "kinds": [
     "bar-widget"
   ],
@@ -13,18 +13,19 @@
     "barWidget": "BarWidget.qml"
   },
   "barWidget": {
-    "displayName": "Comic Releases",
-    "description": "Your League of Comic Geeks pull list (or the weekly release sheet) with cover art, prices, and release dates.",
+    "displayName": "Longbox",
+    "description": "Your comic pull list (or the weekly release sheet) with cover art, prices, and release dates.",
     "category": "Media",
     "aliases": [
       "comics",
+      "longbox",
       "pull-list",
       "comicgeeks"
     ],
     "allowMultiple": false,
     "defaultSection": "right",
     "defaults": {
-      "username": "cupcakeisangry",
+      "username": "",
       "source": "pulls",
       "excludeVariants": true,
       "showCovers": true,
@@ -36,7 +37,7 @@
         "type": "string",
         "label": "League of Comic Geeks username",
         "description": "Your LoCG profile name. Pull lists are public, so no login needed. Leave blank to track the general weekly releases instead.",
-        "defaultValue": "cupcakeisangry"
+        "defaultValue": ""
       },
       {
         "key": "source",

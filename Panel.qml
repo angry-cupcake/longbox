@@ -5,37 +5,99 @@ import Quickshell.Io
 import qs.Commons
 import qs.Ui
 import "Model.js" as Model
+import "Store.js" as Store
 
 Panel {
   id: root
-  moduleName: "hari.comics"
+  moduleName: "angry-cupcake.longbox"
   manageIpc: false
 
   property var anchorItem: null
   property var hostWidget: null
 
-  // Settings (persisted in shell.json by the shell)
-  readonly property string username: String(setting("username", "cupcakeisangry") || "").trim()
-  readonly property string source: setting("source", "pulls") === "releases" ? "releases" : "pulls"
-  readonly property bool excludeVariants: setting("excludeVariants", true) !== false
-  readonly property bool showCovers: setting("showCovers", true) !== false
-  readonly property int refreshIntervalMs: Math.max(10, Number(setting("refreshIntervalMin", 60)) || 60) * 60000
+  // --------------------------------------------------------------- state doc
+  // Single persisted document. shell.json seeds a fresh doc; afterwards the
+  // doc wins. See Store.js for the schema.
+  property var doc: Store.normalizeDoc(null)
+  readonly property bool storageEnabled: doc.settings.storeDataLocally === true
+  readonly property bool archiveEnabled: storageEnabled && doc.settings.archivePulls === true
+  readonly property int archivedWeekCount: Object.keys(doc.archive).length
+  readonly property bool isListView: doc.settings.viewMode !== "grid"
 
-  // State
+  // Effective preferences (doc first, shell.json seed as fallback).
+  readonly property string username: {
+    var u = String(doc.profile.username || "")
+    if (u === "") u = String(setting("username", "") || "")
+    return u.trim()
+  }
+  readonly property string source: doc.settings.source === "releases" ? "releases"
+    : (String(setting("source", "")) === "releases" ? "releases" : "pulls")
+  readonly property bool excludeVariants: doc.settings.excludeVariants !== false
+  readonly property bool showCovers: doc.settings.showCovers !== false
+  readonly property int refreshIntervalMs: Math.max(10, Number(doc.settings.refreshIntervalMin) || 60) * 60000
+
+  // ------------------------------------------------------------ panel state
+  property string activeTab: username === "" ? "settings" : "comics"
   property var issues: []
   property string query: ""
   property bool loading: false
   property string loadError: ""
   property double lastSuccessfulMs: 0
+  property int weekOffset: 0
+  property int fetchExitCode: 0
+
+  // Session-only list filters (reset each open).
+  property bool hideCollected: false
+  property bool hideRead: false
+  property bool wishlistOnly: false
+
+  // True while the current fetch is the automatic second attempt after a
+  // Cloudflare challenge; lets finishRefresh decide between retrying and
+  // escalating to the browser hand-off message.
+  property bool fetchIsRetry: false
+
+  // Profile validation state: null = idle, true/false = result of last check.
+  property bool validatingProfile: false
+  property bool profileValid: false
+  property string profileStatus: ""
+
+  readonly property bool needsSetup: source === "pulls" && username === ""
+
+  readonly property string httpAgent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"
 
   readonly property var visibleIssues: Model.filterIssues(issues, {
     excludeVariants: excludeVariants,
-    query: query
+    query: query,
+    marks: doc.marks,
+    hideCollected: hideCollected,
+    hideRead: hideRead,
+    wishlistOnly: wishlistOnly
   })
-  readonly property string barCount: visibleIssues.length > 0 ? String(visibleIssues.length) : ""
+
+  // The bar count is pinned to the live current-week list (the cache), never
+  // to whatever historical week happens to be open in the panel.
+  readonly property int liveCount: Model.filterIssues(doc.cache.issues, {
+    excludeVariants: excludeVariants
+  }).length
+  readonly property string barCount: needsSetup ? "" : (liveCount > 0 ? String(liveCount) : "")
 
   function pageUrl() {
-    return Model.feedUrl(username, source)
+    return Model.feedUrl(username, source, cachedAnchorMs(), weekOffset)
+  }
+
+  // Server-provided week anchor from the cache, if any (ms, else 0).
+  function cachedAnchorMs() {
+    for (var i = 0; i < doc.cache.issues.length; i++) {
+      var ts = Number(doc.cache.issues[i].releaseTs)
+      if (ts > 0) return ts
+    }
+    return 0
+  }
+
+  readonly property string currentWeekKey: {
+    for (var i = 0; i < issues.length; i++)
+      if (!issues[i].isVariant && issues[i].releaseTs) return Model.weekKeyOf(issues[i].releaseTs)
+    return doc.cache.weekKey || ""
   }
 
   readonly property string weekLabel: {
@@ -45,33 +107,213 @@ Panel {
   }
 
   function barTooltipText() {
-    var who = source === "pulls" && username !== "" ? username + "'s pull list" : "New comics this week"
-    if (weekLabel !== "") who += " \u00b7 " + weekLabel
+    if (needsSetup) return "Longbox · set up your profile to track pulls"
+    var who = source === "pulls" ? username + "'s pull list" : "New comics this week"
+    if (weekOffset !== 0) who += " · browsing " + (weekOffset > 0 ? "+" : "") + weekOffset + "w"
+    else if (weekLabel !== "") who += " · " + weekLabel
     if (loadError !== "") return who + " (offline)"
     return who
   }
   readonly property string barTooltip: barTooltipText()
 
-  function startRefresh() {
+  // ------------------------------------------------------------- persistence
+  FileView {
+    id: stateFile
+    path: Quickshell.env("HOME") + "/.local/state/omarchy/settings/longbox.json"
+    watchChanges: false
+    atomicWrites: true
+    printErrors: false
+    onLoaded: root.loadState(text())
+    onLoadFailed: root.loadState("")
+  }
+
+  function loadState(raw) {
+    var loaded = Store.normalizeDoc(raw)
+    if (raw === "") {
+      // Fresh install: seed from any hand-set shell.json overrides.
+      for (var key in loaded.settings) {
+        var v = setting(key, undefined)
+        if (v !== undefined) loaded.settings[key] = v
+      }
+    }
+    doc = Store.pruneArchive(loaded, 26)
+    // The startup timer usually fires before this async load lands and
+    // bails on needsSetup; kick one refresh now that prefs are known.
+    Qt.callLater(root.startRefresh)
+  }
+
+  function commit(nextDoc) {
+    doc = nextDoc
+    try {
+      stateFile.setText(JSON.stringify(doc))
+    } catch (e) {
+      console.warn("[longbox] state write failed:", e)
+    }
+  }
+
+  function changeSetting(key, value) {
+    commit(Store.setSetting(doc, key, value))
+    if (key === "source" || key === "refreshIntervalMin") startRefresh()
+  }
+
+  function clearAllComicData() {
+    commit(Store.clearComicData(doc))
+    issues = []
+    loadError = ""
+  }
+
+  function clearArchiveOnly() {
+    var next = Store.normalizeDoc(doc)
+    next.archive = {}
+    commit(next)
+  }
+
+  // ----------------------------------------------------------------- fetching
+  // Cloudflare clearance from the user's browser, sent with every request so
+  // bot checks solved once in the browser carry over to the widget.
+  function curlArgs() {
+    var c = String(doc.connection.clearance || "")
+    if (c === "") return []
+    return ["-b", "cf_clearance=" + c]
+  }
+
+  function startRefresh(isAutoRetry) {
     if (fetchProcess.running) return
+    if (needsSetup) return
     loading = true
+    fetchIsRetry = isAutoRetry === true
     loadError = ""
     fetchProcess.command = ["/usr/bin/env", "curl", "-sL", "--max-time", "25",
-      "-A", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
-      pageUrl()]
+      "-A", root.httpAgent].concat(curlArgs(), [pageUrl()])
     fetchProcess.running = true
   }
 
   function finishRefresh() {
     loading = false
     var body = fetchStdout.text
-    var parsed = Model.parseReleases(body)
-    if (parsed.length > 0 || fetchExitCode === 0) {
-      issues = parsed
-      if (parsed.length > 0) lastSuccessfulMs = Date.now()
-      else loadError = "Nothing found for this week."
-    } else {
+    var verdict = Model.diagnose(body)
+
+    if (verdict.status === "challenge") {
+      // One automatic retry; challenges are often per-request. If it
+      // persists, hand the user to the browser + clearance flow.
+      if (!fetchIsRetry) {
+        loadError = "Bot check detected, retrying..."
+        retryTimer.restart()
+        return
+      }
+      loadError = "League of Comic Geeks keeps bot-checking this connection. Open the site in your browser, then paste your clearance cookie in Settings."
+      return
+    }
+    fetchIsRetry = false
+
+    if (verdict.status === "empty" && fetchExitCode !== 0) {
       loadError = "Could not reach League of Comic Geeks."
+      return
+    }
+
+    var parsed = Model.parseReleases(body)
+    issues = parsed
+
+    if (verdict.status === "ok") {
+      // Only the live current-week fetch updates cache, archive, and the
+      // refresh cadence; browsing history must not overwrite them.
+      if (weekOffset === 0) {
+        lastSuccessfulMs = Date.now()
+        saveCache(parsed)
+      }
+    } else if (verdict.status === "suspect") {
+      loadError = "Nothing listed here yet, or the site changed its layout."
+    } else {
+      loadError = "Nothing found for this week."
+    }
+  }
+
+  // Cache the last good fetch so restarts open instantly and offline reads
+  // still show data. Gated by the local-storage toggle.
+  function saveCache(parsed) {
+    if (!storageEnabled) return
+    var weekKey = ""
+    for (var i = 0; i < parsed.length; i++)
+      if (parsed[i].releaseTs) { weekKey = Model.weekKeyOf(parsed[i].releaseTs); break }
+    var next = Store.normalizeDoc(doc)
+    next.cache = { weekKey: weekKey, fetchedMs: Date.now(), issues: parsed }
+    // Pull lists are only public while current: snapshot them now when
+    // archiving is on, so history accumulates week by week.
+    next = Store.archiveIssues(next, weekKey, parsed, { enabled: archiveEnabled && source === "pulls" && weekOffset === 0 })
+    commit(Store.pruneArchive(next, 26))
+  }
+
+  // Load cached issues into the view at startup / before first refresh.
+  function restoreFromCache() {
+    if (issues.length > 0) return
+    if (doc.cache.issues.length > 0 && Date.now() - doc.cache.fetchedMs < 7 * 86400000) {
+      issues = doc.cache.issues
+      lastSuccessfulMs = doc.cache.fetchedMs
+    }
+  }
+
+  // -------------------------------------------------------- profile validation
+  function requestProfileSave(name) {
+    if (validatingProfile) return
+    if (name === "") {
+      // Blank means releases-only mode; valid by definition.
+      profileValid = true
+      profileStatus = "Cleared. Longbox will track general weekly releases."
+      commit(Store.setProfile(doc, "", Date.now()))
+      startRefresh()
+      return
+    }
+    validatingProfile = true
+    profileStatus = "Checking " + name + "..."
+    validateProcess.profileUsername = name
+    validateProcess.command = ["/usr/bin/env", "curl", "-sL", "--max-time", "20",
+      "-A", root.httpAgent].concat(curlArgs(),
+      ["https://leagueofcomicgeeks.com/profile/" + encodeURIComponent(name)])
+    console.warn("[longbox] validate: starting for", name)
+    validateProcess.running = true
+    validateWatchdog.restart()
+  }
+
+  // Safety net: if validation somehow never exits (spawn failure, hang),
+  // release the button again instead of leaving the UI stuck on Checking.
+  Timer {
+    id: validateWatchdog
+    interval: 30000
+    repeat: false
+    onTriggered: {
+      if (!root.validatingProfile) return
+      console.warn("[longbox] validate: watchdog fired, releasing UI")
+      validateProcess.running = false
+      root.validatingProfile = false
+      root.profileValid = false
+      root.profileStatus = "The check timed out. Try again in a moment."
+    }
+  }
+
+  function finishProfileValidation(exitCode) {
+    validateWatchdog.stop()
+    validatingProfile = false
+    var body = validateStdout.text
+    var name = validateProcess.profileUsername
+    var verdict = Model.diagnose(body)
+    var looksReal = exitCode === 0 &&
+      verdict.status !== "challenge" &&
+      body.indexOf("/profile/" + name.toLowerCase()) >= 0
+    console.warn("[longbox] validate: finished verdict=", verdict.status,
+      "looksReal=", looksReal)
+
+    if (looksReal) {
+      profileValid = true
+      profileStatus = name + "'s pull list found and saved."
+      commit(Store.setProfile(doc, name, Date.now()))
+      if (activeTab === "settings" && source === "pulls") activeTab = "comics"
+      startRefresh()
+    } else if (verdict.status === "challenge") {
+      profileValid = false
+      profileStatus = "The site bot-checked us. Open leagueofcomicgeeks.com in your browser once, then try Save again. If it keeps failing, add a clearance cookie in Settings."
+    } else {
+      profileValid = false
+      profileStatus = "Could not find that profile. Check the spelling on leagueofcomicgeeks.com."
     }
   }
 
@@ -80,11 +322,109 @@ Panel {
     if (issue) Qt.openUrlExternally(issue.url)
   }
 
+  // ------------------------------------------------------------- rich tooltips
+  // One shared popup; delegates request show/hide with themselves as the
+  // source so moving between rows never flickers. The Popup parents to the
+  // key catcher, painting above the Flickable's clip.
+  property var tipSource: null
+
+  function showComicTip(issue, srcItem) {
+    if (!comicTip || issue === null) return
+    tipSource = srcItem
+    comicTip.issue = issue
+    comicTip.open()
+    positionComicTip(srcItem)
+  }
+
+  function hideComicTip(srcItem) {
+    if (tipSource !== srcItem) return
+    tipSource = null
+    comicTip.close()
+  }
+
+  function positionComicTip(srcItem) {
+    if (!srcItem || !comicTip.opened) return
+    var p = srcItem.mapToItem(keyCatcher, 0, 0)
+    var w = comicTip.implicitWidth || Style.space(300)
+    var h = comicTip.implicitHeight || Style.space(100)
+    comicTip.x = Math.max(Style.space(4),
+      Math.min(p.x + srcItem.width / 2 - w / 2, keyCatcher.width - w - Style.space(4)))
+    comicTip.y = p.y - h - Style.space(6)
+    if (comicTip.y < Style.space(4))
+      comicTip.y = Math.min(p.y + srcItem.height + Style.space(6), keyCatcher.height - h - Style.space(4))
+  }
+
+  // Flip one local mark facet for an issue: "collected", "read" (stored as
+  // readAt timestamp), or "wishlist". Persists immediately; marks survive
+  // even with comic-data caching disabled.
+  function toggleMark(id, facet) {
+    var entry = doc.marks[id] || {}
+    var key = facet === "read" ? "readAt" : facet
+    var patch = {}
+    patch[key] = !entry[key]
+    commit(Store.markIssue(doc, id, patch))
+  }
+
+  // ---------------------------------------------------------- week navigation
+  // Releases browse any week live via dated URLs. Pull lists are only public
+  // while current, so past weeks render from the local archive snapshot.
+  property bool viewingArchive: false
+
+  function browsedWeekTs() {
+    var anchor = cachedAnchorMs()
+    return anchor ? Model.shiftWeekTs(anchor, weekOffset) : 0
+  }
+
+  function goWeek(delta) {
+    setWeekOffset(weekOffset + delta)
+  }
+
+  function backToCurrentWeek() {
+    setWeekOffset(0)
+  }
+
+  function setWeekOffset(offset) {
+    var clamped = Math.max(-52, Math.min(2, offset))
+    if (clamped === weekOffset && issues.length > 0 && !loadError) return
+    weekOffset = clamped
+    query = ""
+    loadWeek()
+  }
+
+  function loadWeek() {
+    viewingArchive = false
+    if (weekOffset === 0 || cachedAnchorMs() === 0) {
+      startRefresh()
+      return
+    }
+    if (source === "pulls") {
+      var snap = doc.archive[Model.weekKeyOf(browsedWeekTs())]
+      if (snap) {
+        issues = snap.issues
+        loadError = ""
+        viewingArchive = true
+      } else {
+        issues = []
+        loadError = "This week is not archived yet. Weeks are saved while they are current when archiving is on."
+      }
+      return
+    }
+    startRefresh()
+  }
+
   onOpenedChanged: {
     if (opened) {
       query = ""
+      hideCollected = false
+      hideRead = false
+      wishlistOnly = false
+      if (username === "") activeTab = "settings"
+      restoreFromCache()
       if (lastSuccessfulMs === 0 || Date.now() - lastSuccessfulMs >= refreshIntervalMs)
         startRefresh()
+    } else {
+      tipSource = null
+      comicTip.close()
     }
   }
 
@@ -93,9 +433,15 @@ Panel {
     running: true
     repeat: true
     triggeredOnStart: true
-    onTriggered: {
-      root.startRefresh()
-    }
+    onTriggered: root.startRefresh()
+  }
+
+  // Single delayed retry after a bot-checked response.
+  Timer {
+    id: retryTimer
+    interval: 6000
+    repeat: false
+    onTriggered: root.startRefresh(true)
   }
 
   Process {
@@ -112,7 +458,27 @@ Panel {
       Qt.callLater(root.finishRefresh)
     }
   }
-  property int fetchExitCode: 0
+
+  Process {
+    id: validateProcess
+    running: false
+    property string profileUsername: ""
+
+    stdout: StdioCollector {
+      id: validateStdout
+      waitForEnd: true
+    }
+
+    onExited: function(exitCode) {
+      console.warn("[longbox] validate: exited code=", exitCode,
+        "bytes=", validateStdout.text ? validateStdout.text.length : 0)
+      Qt.callLater(function() { root.finishProfileValidation(exitCode) })
+    }
+  }
+
+  Component.onCompleted: {
+    if (username === "") activeTab = "settings"
+  }
 
   KeyboardPanel {
     id: panel
@@ -139,6 +505,8 @@ Panel {
         flickableDirection: Flickable.VerticalFlick
         interactive: contentHeight > height
         ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+        onContentYChanged: comicTip.close()
+        onMovingChanged: if (moving) comicTip.close()
 
         Column {
           id: content
@@ -147,10 +515,11 @@ Panel {
 
           PanelHero {
             width: parent.width
-            title: root.source === "pulls" && root.username !== ""
-              ? root.username + "'s pulls" : "New comics"
-            meta: root.loading ? "Loading\u2026" : root.weekLabel + " \u00b7 "
+            title: root.needsSetup ? "Longbox" : (root.source === "pulls"
+              ? root.username + "'s pulls" : "New comics")
+            meta: root.loading ? "Loading..." : root.weekLabel + " · "
               + root.visibleIssues.length + (root.visibleIssues.length === 1 ? " issue" : " issues")
+              + (root.viewingArchive ? " · archived" : "")
             detail: root.loadError
             foreground: root.barForeground
             fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
@@ -180,113 +549,334 @@ Panel {
             }
           }
 
-          TextField {
-            visible: root.source === "releases"
+          ButtonGroup {
             width: parent.width
-            placeholderText: "Filter titles or publishers\u2026"
-            color: root.barForeground
-            placeholderTextColor: Qt.darker(root.barForeground, 1.6)
-            font.family: root.bar ? root.bar.fontFamily : Style.font.family
-            font.pixelSize: Style.font.body
-            background: Rectangle {
-              color: Qt.darker(root.barForeground, 8)
-              opacity: 0.35
-              radius: Style.space(6)
-            }
-            onTextChanged: root.query = text
+            options: [
+              { value: "comics", label: "Comics" },
+              { value: "settings", label: "Settings" }
+            ]
+            value: root.activeTab
+            foreground: root.barForeground
+            fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
+            focusable: false
+            onChanged: function(v) { root.activeTab = v }
           }
 
-          Repeater {
-            model: root.visibleIssues
+          Row {
+            width: parent.width
+            spacing: Style.space(6)
+            visible: root.activeTab === "comics" && !root.needsSetup
 
-            delegate: ItemDelegate {
-              required property var modelData
-              required property int index
-              width: content.width
-              height: Math.max(Style.space(58), coverImage.height + Style.space(8))
-              background: null
+            PanelActionButton {
+              id: prevWeekButton
+              anchors.verticalCenter: parent.verticalCenter
+              iconText: "\uf060"
+              tooltipText: "Previous week"
+              foreground: root.barForeground
+              fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
+              enabled: !root.loading && root.cachedAnchorMs() !== 0 && root.weekOffset > -52
+              onClicked: root.goWeek(-1)
+            }
 
-              onClicked: root.openIssue(index)
+            PanelActionButton {
+              id: nextWeekButton
+              anchors.verticalCenter: parent.verticalCenter
+              iconText: "\uf061"
+              tooltipText: "Next week"
+              foreground: root.barForeground
+              fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
+              enabled: !root.loading && root.cachedAnchorMs() !== 0 && root.weekOffset < 2
+              onClicked: root.goWeek(1)
+            }
+
+            Text {
+              anchors.verticalCenter: parent.verticalCenter
+              width: parent.width - prevWeekButton.width - nextWeekButton.width
+                - (root.weekOffset !== 0 ? todayButton.width : 0)
+                - parent.spacing * 2
+              text: {
+                var label = Model.weekLabel(root.browsedWeekTs())
+                if (label === "") label = "This week"
+                if (root.source === "pulls" && root.weekOffset !== 0) label += " (from archive)"
+                return label
+              }
+              color: Qt.darker(root.barForeground, 1.3)
+              font.family: root.bar ? root.bar.fontFamily : Style.font.family
+              font.pixelSize: Style.font.caption
+              elide: Text.ElideRight
+            }
+
+            PanelActionButton {
+              id: todayButton
+              anchors.verticalCenter: parent.verticalCenter
+              visible: root.weekOffset !== 0
+              iconText: "\uf017"
+              tooltipText: "Back to the current week"
+              foreground: root.barForeground
+              fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
+              enabled: !root.loading
+              onClicked: root.backToCurrentWeek()
+            }
+          }
+
+          SettingsTab {
+            width: parent.width
+            visible: root.activeTab === "settings"
+            panel: root
+            foreground: root.barForeground
+            fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
+
+            onProfileSaveRequested: function(name) { root.requestProfileSave(name) }
+            onSettingChanged: function(key, value) { root.changeSetting(key, value) }
+            onClearComicDataRequested: root.clearAllComicData()
+            onClearArchiveRequested: root.clearArchiveOnly()
+            onConnectionChanged: function(clearance, ua) {
+              root.commit(Store.setConnection(root.doc, clearance, ua))
+            }
+            onOpenSiteRequested: Qt.openUrlExternally("https://leagueofcomicgeeks.com")
+          }
+
+          Column {
+            id: comicsList
+            width: parent.width
+            spacing: Style.space(0)
+            visible: root.activeTab === "comics"
+
+              TextField {
+                visible: root.source === "releases"
+                width: parent.width
+                placeholderText: "Filter titles or publishers..."
+                color: root.barForeground
+                placeholderTextColor: Qt.darker(root.barForeground, 1.6)
+                font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                font.pixelSize: Style.font.body
+                background: Rectangle {
+                  color: Qt.darker(root.barForeground, 8)
+                  opacity: 0.35
+                  radius: Style.space(6)
+                }
+                onTextChanged: root.query = text
+              }
 
               Row {
-                anchors.fill: parent
-                spacing: Style.space(10)
+                width: parent.width
+                spacing: Style.space(6)
+                visible: root.visibleIssues.length > 0 || root.hideCollected || root.hideRead || root.wishlistOnly
 
-                Image {
-                  id: coverImage
-                  visible: root.showCovers
-                  width: Style.space(38)
-                  height: visible ? Style.space(56) : 0
-                  anchors.verticalCenter: parent.verticalCenter
-                  asynchronous: true
-                  fillMode: Image.PreserveAspectCrop
-                  source: modelData.cover !== "" ? modelData.cover : ""
+                Button {
+                  text: "Hide collected"
+                  bordered: true
+                  selected: root.hideCollected
+                  foreground: root.barForeground
+                  fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
+                  onClicked: root.hideCollected = !root.hideCollected
                 }
 
-                Column {
-                  width: parent.width - (coverImage.visible ? coverImage.width : 0) - Style.space(10) - badge.width
-                  anchors.verticalCenter: parent.verticalCenter
-                  spacing: Style.space(2)
-
-                  Text {
-                    width: parent.width
-                    text: Model.cleanText(modelData.title)
-                    color: root.barForeground
-                    font.family: root.bar ? root.bar.fontFamily : Style.font.family
-                    font.pixelSize: Style.font.body
-                    elide: Text.ElideRight
-                  }
-
-                  Text {
-                    width: parent.width
-                    text: {
-                      var parts = []
-                      if (modelData.publisher !== "") parts.push(Model.cleanText(modelData.publisher))
-                      if (modelData.price !== "") parts.push(modelData.price)
-                      if (root.source === "releases" && modelData.pulls > 0)
-                        parts.push(Model.formatPulls(modelData.pulls) + " pulls")
-                      return parts.join("  \u00b7  ")
-                    }
-                    color: Qt.darker(root.barForeground, 1.45)
-                    font.family: root.bar ? root.bar.fontFamily : Style.font.family
-                    font.pixelSize: Style.font.caption
-                    elide: Text.ElideRight
-                  }
+                Button {
+                  text: "Hide read"
+                  bordered: true
+                  selected: root.hideRead
+                  foreground: root.barForeground
+                  fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
+                  onClicked: root.hideRead = !root.hideRead
                 }
 
-                Text {
-                  id: badge
-                  anchors.verticalCenter: parent.verticalCenter
-                  text: {
-                    var days = Model.daysUntil(modelData.releaseTs)
-                    if (days === null) return ""
-                    if (days <= 0) return "OUT"
-                    return "in " + days + "d"
-                  }
-                  color: {
-                    var days = Model.daysUntil(modelData.releaseTs)
-                    return days !== null && days <= 0 ? Color.accent : Qt.darker(root.barForeground, 1.3)
-                  }
-                  font.family: root.bar ? root.bar.fontFamily : Style.font.family
-                  font.pixelSize: Style.font.caption
-                  font.bold: true
+                Button {
+                  text: "Wishlist only"
+                  bordered: true
+                  selected: root.wishlistOnly
+                  foreground: root.barForeground
+                  fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
+                  onClicked: root.wishlistOnly = !root.wishlistOnly
                 }
               }
-            }
-          }
 
-          Text {
-            width: parent.width
-            visible: !root.loading && root.visibleIssues.length === 0
-            text: root.source === "pulls"
-              ? "No pulls this week, or the list is private. Add comics on League of Comic Geeks."
-              : "No matching releases."
-            color: Qt.darker(root.barForeground, 1.45)
-            font.family: root.bar ? root.bar.fontFamily : Style.font.family
-            font.pixelSize: Style.font.caption
-            wrapMode: Text.WordWrap
+              // NOTE: a Repeater's delegates are siblings inside this
+              // Column, not children of the Repeater, so hiding the
+              // Repeater hides nothing. Each row carries the visibility
+              // binding itself; the positioner then skips them.
+              Repeater {
+                id: listRepeat
+                model: root.visibleIssues
+
+                delegate: ItemDelegate {
+                  id: issueRow
+                  required property var modelData
+                  required property int index
+
+                  readonly property var mark: root.doc.marks[modelData.id] || null
+                  readonly property bool isCollected: mark ? !!mark.collected : false
+                  readonly property bool isRead: mark ? !!mark.readAt : false
+                  readonly property bool isWished: mark ? !!mark.wishlist : false
+
+                  visible: root.isListView
+                  width: comicsList.width
+                  height: Math.max(Style.space(58), coverSlot.height + Style.space(8))
+                  background: null
+                  hoverEnabled: true
+
+                  onClicked: root.openIssue(index)
+                  onHoveredChanged: {
+                    if (hovered) root.showComicTip(modelData, issueRow)
+                    else root.hideComicTip(issueRow)
+                  }
+
+                  Row {
+                    anchors.fill: parent
+                    spacing: Style.space(10)
+
+                    Item {
+                      id: coverSlot
+                      visible: root.showCovers
+                      width: visible ? Style.space(38) : 0
+                      height: visible ? Style.space(56) : 0
+                      anchors.verticalCenter: parent.verticalCenter
+
+                      Image {
+                        id: coverImage
+                        anchors.fill: parent
+                        asynchronous: true
+                        fillMode: Image.PreserveAspectCrop
+                        source: issueRow.modelData.cover !== "" ? issueRow.modelData.cover : ""
+                      }
+
+                      Text {
+                        visible: issueRow.isCollected
+                        text: "\uf00c"
+                        anchors.right: parent.right
+                        anchors.bottom: parent.bottom
+                        color: Color.accent
+                        font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                        font.pixelSize: Style.space(10)
+                      }
+
+                      Text {
+                        visible: issueRow.isWished
+                        text: "\uf005"
+                        anchors.right: parent.right
+                        anchors.top: parent.top
+                        color: Color.accent
+                        font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                        font.pixelSize: Style.space(10)
+                      }
+                    }
+
+                    Column {
+                      id: textColumn
+                      width: parent.width - coverSlot.width - badgeText.width - actionsStrip.width
+                        - parent.spacing * 3
+                      anchors.verticalCenter: parent.verticalCenter
+                      spacing: Style.space(2)
+
+                      Text {
+                        width: parent.width
+                        text: Model.cleanText(issueRow.modelData.title)
+                        color: issueRow.isRead ? Qt.darker(root.barForeground, 2.1) : root.barForeground
+                        font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                        font.pixelSize: Style.font.body
+                        font.strikeout: issueRow.isRead
+                        elide: Text.ElideRight
+                      }
+
+                      Text {
+                        width: parent.width
+                        text: {
+                          var parts = []
+                          if (issueRow.modelData.publisher !== "") parts.push(Model.cleanText(issueRow.modelData.publisher))
+                          if (issueRow.modelData.price !== "") parts.push(issueRow.modelData.price)
+                          if (root.source === "releases" && issueRow.modelData.pulls > 0)
+                            parts.push(Model.formatPulls(issueRow.modelData.pulls) + " pulls")
+                          return parts.join("  ·  ")
+                        }
+                        color: Qt.darker(root.barForeground, 1.45)
+                        font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                        font.pixelSize: Style.font.caption
+                        elide: Text.ElideRight
+                      }
+                    }
+
+                    Text {
+                      id: badgeText
+                      anchors.verticalCenter: parent.verticalCenter
+                      text: {
+                        var days = Model.daysUntil(issueRow.modelData.releaseTs)
+                        if (days === null) return ""
+                        if (days <= 0) return "OUT"
+                        return "in " + days + "d"
+                      }
+                      color: {
+                        var days = Model.daysUntil(issueRow.modelData.releaseTs)
+                        return days !== null && days <= 0 ? Color.accent : Qt.darker(root.barForeground, 1.3)
+                      }
+                      font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                      font.pixelSize: Style.font.caption
+                      font.bold: true
+                    }
+
+                    Row {
+                      id: actionsStrip
+                      anchors.verticalCenter: parent.verticalCenter
+                      spacing: Style.space(6)
+                      opacity: issueRow.hovered ? 1 : 0
+
+                      MarkGlyph {
+                        anchors.verticalCenter: parent.verticalCenter
+                        activeMark: issueRow.isCollected
+                        text: "\uf00c"
+                        onActivated: root.toggleMark(issueRow.modelData.id, "collected")
+                      }
+
+                      MarkGlyph {
+                        anchors.verticalCenter: parent.verticalCenter
+                        activeMark: issueRow.isRead
+                        text: "\uf06e"
+                        onActivated: root.toggleMark(issueRow.modelData.id, "read")
+                      }
+
+                      MarkGlyph {
+                        anchors.verticalCenter: parent.verticalCenter
+                        activeMark: issueRow.isWished
+                        text: "\uf005"
+                        onActivated: root.toggleMark(issueRow.modelData.id, "wishlist")
+                      }
+                    }
+                  }
+                }
+              }
+
+              IssueGrid {
+                visible: !root.isListView
+                width: parent.width
+                height: contentHeight
+                panel: root
+                model: root.visibleIssues
+                foreground: root.barForeground
+                fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
+                onIssueActivated: function(index) { root.openIssue(index) }
+              }
+
+              Text {
+                id: emptyState
+                width: parent.width
+                visible: !root.loading && root.visibleIssues.length === 0
+                text: root.needsSetup
+                  ? "Set your League of Comic Geeks username in Settings to track your pull list."
+                  : (root.loadError !== "" ? root.loadError :
+                    (root.source === "pulls"
+                      ? "No pulls this week, or the list is private. Add comics on League of Comic Geeks."
+                      : "No matching releases."))
+                color: Qt.darker(root.barForeground, 1.45)
+                font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                font.pixelSize: Style.font.caption
+                wrapMode: Text.WordWrap
+              }
           }
         }
+      }
+
+      ComicToolTip {
+        id: comicTip
+        fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
       }
     }
   }
