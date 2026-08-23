@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "angry-cupcake.longbox",
   "name": "Longbox",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "author": "angry-cupcake",
   "license": "MIT",
   "description": "Your comic pull list and the weekly release sheet, right in your bar.",
@@ -29,7 +29,7 @@
       "source": "pulls",
       "excludeVariants": true,
       "showCovers": true,
-      "refreshIntervalMin": 60
+      "refreshIntervalMin": 360
     },
     "schema": [
       {
@@ -67,9 +67,9 @@
         "key": "refreshIntervalMin",
         "type": "integer",
         "label": "Refresh interval (minutes)",
-        "min": 10,
+        "min": 60,
         "max": 720,
-        "step": 10,
+        "step": 60,
         "defaultValue": 60
       }
     ]

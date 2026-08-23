@@ -65,7 +65,7 @@ BarWidget {
     onPressed: function(buttonCode) {
       if (buttonCode === Qt.LeftButton) root.toggle()
       else if (buttonCode === Qt.RightButton && panelLoader.item)
-        Qt.openUrlExternally(panelLoader.item.pageUrl())
+        Qt.openUrlExternally(panelLoader.item.siteUrl())
     }
   }
 }

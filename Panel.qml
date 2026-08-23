@@ -34,10 +34,10 @@ Panel {
     : (String(setting("source", "")) === "releases" ? "releases" : "pulls")
   readonly property bool excludeVariants: doc.settings.excludeVariants !== false
   readonly property bool showCovers: doc.settings.showCovers !== false
-  readonly property int refreshIntervalMs: Math.max(10, Number(doc.settings.refreshIntervalMin) || 60) * 60000
+  readonly property int refreshIntervalMs: Math.max(10, Number(doc.settings.refreshIntervalMin) || 360) * 60000
 
   // ------------------------------------------------------------ panel state
-  property string activeTab: username === "" ? "settings" : "comics"
+  property string activeTab: needsSetup ? "settings" : "comics"
   property var issues: []
   property string query: ""
   property bool loading: false
@@ -61,7 +61,16 @@ Panel {
   property bool profileValid: false
   property string profileStatus: ""
 
-  readonly property bool needsSetup: source === "pulls" && username === ""
+  // Opt-in LoCG account session. Only the cookie lives in the doc; the
+  // password exists solely inside requestSignIn's call frame.
+  readonly property bool signedIn: Store.isSignedIn(doc)
+  readonly property string displayUser: signedIn ? doc.account.name : username
+  property bool signingIn: false
+  property string loginStatus: ""
+  property string pendingSession: ""
+  property string pendingName: ""
+
+  readonly property bool needsSetup: !signedIn && source === "pulls" && username === ""
 
   readonly property string httpAgent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"
 
@@ -81,8 +90,40 @@ Panel {
   }).length
   readonly property string barCount: needsSetup ? "" : (liveCount > 0 ? String(liveCount) : "")
 
-  function pageUrl() {
-    return Model.feedUrl(username, source, cachedAnchorMs(), weekOffset)
+  // Cookie flags for curl. Values are charset-sanitized in Store.js, so each
+  // pair is a single shell-safe word; repeated -b flags merge into one jar.
+  function cookieArgs(sessionOverride) {
+    var cookies = []
+    var clearance = String(doc.connection.clearance || "")
+    if (clearance !== "") cookies.push("cf_clearance=" + clearance)
+    if (sessionOverride !== undefined) {
+      if (sessionOverride !== "") cookies.push("ci_session=" + sessionOverride)
+    } else if (signedIn) {
+      cookies.push("ci_session=" + doc.account.session)
+    }
+    var args = []
+    for (var i = 0; i < cookies.length; i++) args.push("-b", cookies[i])
+    return args
+  }
+
+  function curlArgs() {
+    return cookieArgs()
+  }
+
+  // Route per auth state: signed-in pulls come from the AJAX API for any
+  // week; anonymous pulls still scrape the public profile page; releases
+  // always use the AJAX endpoint.
+  function fetchUrl() {
+    if (signedIn) return Model.ajaxUrl("pulls", doc.account.userId, cachedAnchorMs(), weekOffset)
+    if (source === "pulls") return Model.feedUrl(username, "pulls", 0, 0)
+    return Model.ajaxUrl("releases", 0, cachedAnchorMs(), weekOffset)
+  }
+
+  // Human-facing page for the bar widget's right-click "open on LoCG".
+  function siteUrl() {
+    if (source === "pulls" && displayUser !== "")
+      return "https://leagueofcomicgeeks.com/profile/" + encodeURIComponent(displayUser) + "/pull-list"
+    return "https://leagueofcomicgeeks.com/comics/new-comics"
   }
 
   // Server-provided week anchor from the cache, if any (ms, else 0).
@@ -108,7 +149,7 @@ Panel {
 
   function barTooltipText() {
     if (needsSetup) return "Longbox · set up your profile to track pulls"
-    var who = source === "pulls" ? username + "'s pull list" : "New comics this week"
+    var who = source === "pulls" ? displayUser + "'s pull list" : "New comics this week"
     if (weekOffset !== 0) who += " · browsing " + (weekOffset > 0 ? "+" : "") + weekOffset + "w"
     else if (weekLabel !== "") who += " · " + weekLabel
     if (loadError !== "") return who + " (offline)"
@@ -146,6 +187,7 @@ Panel {
     doc = nextDoc
     try {
       stateFile.setText(JSON.stringify(doc))
+      ensureStatePerms()
     } catch (e) {
       console.warn("[longbox] state write failed:", e)
     }
@@ -169,13 +211,8 @@ Panel {
   }
 
   // ----------------------------------------------------------------- fetching
-  // Cloudflare clearance from the user's browser, sent with every request so
-  // bot checks solved once in the browser carry over to the widget.
-  function curlArgs() {
-    var c = String(doc.connection.clearance || "")
-    if (c === "") return []
-    return ["-b", "cf_clearance=" + c]
-  }
+  // Cloudflare clearance (and, when signed in, the account session) travel
+  // with every request; see cookieArgs() above.
 
   function startRefresh(isAutoRetry) {
     if (fetchProcess.running) return
@@ -184,14 +221,15 @@ Panel {
     fetchIsRetry = isAutoRetry === true
     loadError = ""
     fetchProcess.command = ["/usr/bin/env", "curl", "-sL", "--max-time", "25",
-      "-A", root.httpAgent].concat(curlArgs(), [pageUrl()])
+      "-A", root.httpAgent].concat(curlArgs(), [fetchUrl()])
     fetchProcess.running = true
   }
 
   function finishRefresh() {
     loading = false
     var body = fetchStdout.text
-    var verdict = Model.diagnose(body)
+    var usesAjax = signedIn || source === "releases"
+    var verdict = usesAjax ? Model.classifyAjax(body) : Model.diagnose(body)
 
     if (verdict.status === "challenge") {
       // One automatic retry; challenges are often per-request. If it
@@ -207,11 +245,26 @@ Panel {
     fetchIsRetry = false
 
     if (verdict.status === "empty" && fetchExitCode !== 0) {
-      loadError = "Could not reach League of Comic Geeks."
+      if (!showArchiveFallback()) loadError = "Could not reach League of Comic Geeks."
       return
     }
 
-    var parsed = Model.parseReleases(body)
+    if (usesAjax) finishAjax(verdict, body)
+    else finishHtml(verdict, body)
+  }
+
+  function finishAjax(verdict, body) {
+    // Session liveness: a signed-in pull request answered by the anonymous
+    // zero state (data-user 0 + "You don't have any comics pulled") means
+    // the cookie expired. Sign out gracefully and refetch anonymously.
+    // The API's user echo is unreliable for this - see looksAnonymousPull.
+    if (signedIn && source === "pulls" && verdict.status === "nolists"
+        && Model.looksAnonymousPull(body)) {
+      expireSession()
+      return
+    }
+
+    var parsed = Model.parseAjaxList(body)
     issues = parsed
 
     if (verdict.status === "ok") {
@@ -221,11 +274,49 @@ Panel {
         lastSuccessfulMs = Date.now()
         saveCache(parsed)
       }
+    } else if (verdict.status === "nolists") {
+      loadError = signedIn && source === "pulls"
+        ? "No pulls this week. Add comics on League of Comic Geeks."
+        : "Nothing listed this week yet."
+    } else {
+      if (!showArchiveFallback())
+        loadError = "Nothing listed here yet, or the site changed its layout."
+    }
+  }
+
+  function finishHtml(verdict, body) {
+    var parsed = Model.parseReleases(body)
+    issues = parsed
+    if (verdict.status === "ok") {
+      if (weekOffset === 0) {
+        lastSuccessfulMs = Date.now()
+        saveCache(parsed)
+      }
     } else if (verdict.status === "suspect") {
       loadError = "Nothing listed here yet, or the site changed its layout."
     } else {
       loadError = "Nothing found for this week."
     }
+  }
+
+  // When a live fetch fails while browsing history, fall back to the local
+  // archive snapshot for that week, if one exists.
+  function showArchiveFallback() {
+    if (source !== "pulls" || weekOffset === 0) return false
+    var snap = doc.archive[Model.weekKeyOf(browsedWeekTs())]
+    if (!snap || !snap.issues || snap.issues.length === 0) return false
+    issues = snap.issues
+    viewingArchive = true
+    loadError = "Live fetch failed - showing the archived snapshot."
+    return true
+  }
+
+  // The stored cookie stopped working. Keep identity fields so Settings can
+  // say who expired, clear the session, and continue anonymously.
+  function expireSession() {
+    commit(Store.setAccount(doc, { session: "" }))
+    loginStatus = "Your session expired - sign in again in Settings. Showing public data meanwhile."
+    startRefresh()
   }
 
   // Cache the last good fetch so restarts open instantly and offline reads
@@ -317,6 +408,156 @@ Panel {
     }
   }
 
+  // ------------------------------------------------------------- opt-in sign-in
+  // POSTs credentials once, keeps only the returned ci_session cookie, then
+  // discovers the numeric user id with one authenticated pull-list request
+  // sent without user_id (the server resolves the session owner).
+  function requestSignIn(name, pass) {
+    if (signingIn || name === "" || pass === "") return
+    signingIn = true
+    loginStatus = "Signing in as " + name + "..."
+    pendingName = name
+    // Credentials travel via environment, never argv: process command lines
+    // are world-readable, environ is not.
+    loginProcess.environment = ({
+      LONGBOX_USER: name,
+      LONGBOX_PASS: pass,
+      LONGBOX_AGENT: root.httpAgent,
+      LONGBOX_COOKIES: cookieArgs("").join(" ")
+    })
+    loginProcess.command = ["/bin/sh", "-c",
+      "exec curl -siL --max-time 25 -A \"$LONGBOX_AGENT\" $LONGBOX_COOKIES" +
+      " --data-urlencode \"username=$LONGBOX_USER\"" +
+      " --data-urlencode \"password=$LONGBOX_PASS\"" +
+      " \"https://leagueofcomicgeeks.com/login\"",
+      "longbox-login"]
+    loginProcess.running = true
+    loginWatchdog.restart()
+  }
+
+  function finishSignIn(username) {
+    loginWatchdog.stop()
+    signingIn = false
+    var out = loginStdout.text
+    var session = Model.extractCiSession(out)
+    var errText = Model.loginErrorFromHtml(out)
+
+    if (errText !== "") {
+      loginStatus = "Sign-in failed: " + errText
+      return
+    }
+    if (session === "") {
+      loginStatus = "Could not sign in - network trouble or a bot check. Try again shortly."
+      return
+    }
+
+    pendingSession = session
+    signingIn = true
+    // Learn the numeric account id from the public profile page - reliable,
+    // unlike the API's user echo which follows request params, not sessions.
+    whoamiProcess.command = ["/usr/bin/env", "curl", "-sL", "--max-time", "20",
+      "-A", root.httpAgent].concat(cookieArgs(session),
+      ["https://leagueofcomicgeeks.com/profile/" + encodeURIComponent(username) + "/pull-list"])
+    whoamiProcess.running = true
+    whoamiWatchdog.restart()
+    loginStatus = "Signed in as " + username + ", loading your lists..."
+  }
+
+  function finishWhoami() {
+    whoamiWatchdog.stop()
+    signingIn = false
+    var uid = Model.extractProfileUserId(whoamiStdout.text)
+    if (uid <= 0) {
+      loginStatus = "Could not find a profile for that name. Check the spelling and try again."
+      return
+    }
+    commit(Store.setAccount(doc, {
+      session: pendingSession,
+      userId: uid,
+      name: pendingName,
+      signedInAt: Date.now()
+    }))
+    ensureStatePerms()
+    loginStatus = "Signed in as " + pendingName + ". Past weeks now load live."
+    if (activeTab === "settings" && source === "pulls") activeTab = "comics"
+    startRefresh()
+  }
+
+  function signOut() {
+    commit(Store.clearAccount(doc))
+    loginStatus = "Signed out. Pull lists now follow the public profile above."
+    if (weekOffset !== 0) backToCurrentWeek()
+    else startRefresh()
+  }
+
+  // The state doc holds a bearer cookie; keep the file owner-only. Atomic
+  // writes recreate the inode, so re-assert after each commit.
+  Process {
+    id: permsProcess
+    running: false
+  }
+
+  function ensureStatePerms() {
+    if (permsProcess.running) return
+    permsProcess.command = ["/usr/bin/chmod", "600",
+      Quickshell.env("HOME") + "/.local/state/omarchy/settings/longbox.json"]
+    permsProcess.running = true
+  }
+
+  Process {
+    id: loginProcess
+    running: false
+
+    environment: ({})
+
+    stdout: StdioCollector {
+      id: loginStdout
+      waitForEnd: true
+    }
+
+    onExited: function() {
+      Qt.callLater(function() { root.finishSignIn(root.pendingName) })
+    }
+  }
+
+  Timer {
+    id: loginWatchdog
+    interval: 30000
+    repeat: false
+    onTriggered: {
+      if (!root.signingIn) return
+      loginProcess.running = false
+      root.signingIn = false
+      root.loginStatus = "Sign-in timed out. Try again in a moment."
+    }
+  }
+
+  Process {
+    id: whoamiProcess
+    running: false
+
+    stdout: StdioCollector {
+      id: whoamiStdout
+      waitForEnd: true
+    }
+
+    onExited: function() {
+      Qt.callLater(function() { root.finishWhoami() })
+    }
+  }
+
+  Timer {
+    id: whoamiWatchdog
+    interval: 30000
+    repeat: false
+    onTriggered: {
+      if (!root.signingIn) return
+      whoamiProcess.running = false
+      root.signingIn = false
+      root.loginStatus = "Could not confirm the session. Try again in a moment."
+    }
+  }
+
   function openIssue(index) {
     var issue = visibleIssues[index]
     if (issue) Qt.openUrlExternally(issue.url)
@@ -397,7 +638,9 @@ Panel {
       startRefresh()
       return
     }
-    if (source === "pulls") {
+    // Anonymous pulls are only public while current: past weeks render from
+    // the local archive snapshot. Signed in, the API serves any week live.
+    if (source === "pulls" && !signedIn) {
       var snap = doc.archive[Model.weekKeyOf(browsedWeekTs())]
       if (snap) {
         issues = snap.issues
@@ -405,7 +648,7 @@ Panel {
         viewingArchive = true
       } else {
         issues = []
-        loadError = "This week is not archived yet. Weeks are saved while they are current when archiving is on."
+        loadError = "This week is not archived yet. Weeks are saved while they are current when archiving is on - or sign in to browse history live."
       }
       return
     }
@@ -418,7 +661,7 @@ Panel {
       hideCollected = false
       hideRead = false
       wishlistOnly = false
-      if (username === "") activeTab = "settings"
+      if (needsSetup) activeTab = "settings"
       restoreFromCache()
       if (lastSuccessfulMs === 0 || Date.now() - lastSuccessfulMs >= refreshIntervalMs)
         startRefresh()
@@ -477,7 +720,8 @@ Panel {
   }
 
   Component.onCompleted: {
-    if (username === "") activeTab = "settings"
+    if (needsSetup) activeTab = "settings"
+    ensureStatePerms()
   }
 
   KeyboardPanel {
@@ -516,7 +760,7 @@ Panel {
           PanelHero {
             width: parent.width
             title: root.needsSetup ? "Longbox" : (root.source === "pulls"
-              ? root.username + "'s pulls" : "New comics")
+              ? root.displayUser + "'s pulls" : "New comics")
             meta: root.loading ? "Loading..." : root.weekLabel + " · "
               + root.visibleIssues.length + (root.visibleIssues.length === 1 ? " issue" : " issues")
               + (root.viewingArchive ? " · archived" : "")
@@ -630,6 +874,8 @@ Panel {
             onSettingChanged: function(key, value) { root.changeSetting(key, value) }
             onClearComicDataRequested: root.clearAllComicData()
             onClearArchiveRequested: root.clearArchiveOnly()
+            onSignInRequested: function(name, pass) { root.requestSignIn(name, pass) }
+            onSignOutRequested: root.signOut()
             onConnectionChanged: function(clearance, ua) {
               root.commit(Store.setConnection(root.doc, clearance, ua))
             }

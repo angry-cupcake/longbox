@@ -1,8 +1,14 @@
 # Longbox
 
-A comic pull-list widget for the Omarchy Quattro bar.
+A comic pull-list widget for the Omarchy bar.
 
-Longbox shows your public pull list from [leagueofcomicgeeks.com](https://leagueofcomicgeeks.com) as a bar count, with a popup panel listing this week's pulls: cover art, publisher, price, and release status. It can also browse the general weekly release sheet for any past or future week. No login required.
+<p>
+  <img src="screenshots/pull-list-panel.png" width="380" alt="Longbox panel showing this week's pulls with cover art, publisher, price, and release badges">
+  
+  <img src="screenshots/bar-widget-grid.jpg" width="560" alt="Longbox in the Omarchy bar with this week's count, opening a poster-grid view over the desktop">
+</p>
+
+Longbox shows your pull list from [leagueofcomicgeeks.com](https://leagueofcomicgeeks.com) as a bar count, with a popup panel listing this week's comics: cover art, publisher, price, and release status. Browse the weekly release sheet for any week, mark issues as collected/read/wishlisted, and optionally sign in to load your pulls live for every week - past and future.
 
 ## Install
 
@@ -13,49 +19,81 @@ omarchy plugin add https://github.com/angry-cupcake/longbox.git --enable
 ## Usage
 
 - **Left-click** the book icon to open the panel
-- **Right-click** to open your pull list on leagueofcomicgeeks.com
-- On first open, Longbox asks for your League of Comic Geeks username. Leave it blank to track general weekly releases instead.
+- **Right-click** to open your pull list (or the release sheet) on leagueofcomicgeeks.com
 - Hover a comic to preview it; click to open its LoCG page
-- Hover actions mark comics as collected, read, or wishlisted (stored locally)
+- Hover actions mark comics as collected, read, or wishlisted
+- The arrow buttons move between weeks; the clock button jumps back to the current week
 
-### Week navigation
+### Getting started (no account needed)
 
-The arrow buttons in the panel move between weeks. Releases can browse any week live. Pull lists are only public on LoCG while current, so previous weeks come from your local archive: when archiving is enabled, each week's pulls are snapshotted while they are current and history builds up over time.
+On first open you land on Settings. Two ways to use Longbox anonymously:
 
-### Settings tab
+- **Profile name**: enter your LoCG username and Save. Your public pull list loads for the current week. Past weeks come from the local archive (see Storage below).
+- **Releases mode**: leave the profile blank and switch Source to "Releases" to browse everything shipping that week.
 
-Everything is configurable in the panel's Settings tab:
+### Optional sign-in
 
-- Profile: your LoCG username, validated live against the site
-- Source: your pull list or the full weekly releases
-- View: compact list or a poster grid
-- Variant covers, cover art, refresh interval
-- Storage: local caching of fetched data (on by default) and pull-list archiving (off by default)
+The League of Comic Geeks section can sign you in. Anonymous access always works for basics; signing in adds:
 
-Marks, profile, and preferences always persist locally in `~/.local/state/omarchy/settings/longbox.json`. Turning off "Store comic data locally" clears cached issues and archives immediately; the widget then re-fetches after every restart (not recommended: slower panel opens and no offline data).
+- **Live history**: your pull list loads from LoCG's API for any past or future week - no waiting for the local archive to accumulate.
+- **Resilience**: if a live fetch fails while browsing history, an archived snapshot is shown automatically when one exists.
+
+Security model: your password is used once for the sign-in request and never written anywhere - not even to disk in memory dumps of the process list, since it travels through the process environment rather than command-line arguments. Only the resulting session cookie is stored, in a state file kept owner-only (`chmod 600`). LoCG expires sessions after a while; when that happens Longbox quietly falls back to anonymous mode and asks you to sign in again.
+
+### Marks
+
+Hover actions set local marks: **collected**, **read**, or **wishlist**. Marks are stored on this device only and survive even with data caching disabled. They do not sync to your LoCG account yet (see Roadmap).
+
+## Settings tab
+
+Options are grouped into collapsible sections ordered by how often they change:
+
+| Section | Default state | Contents |
+|---------|---------------|----------|
+| Comics | open | Source (pulls/releases), view mode, variant covers, cover art, refresh interval |
+| League of Comic Geeks | opens when relevant | Profile name, optional sign-in/sign-out |
+| Storage | collapsed | Local caching, pull-list archiving, clear buttons |
+| Advanced | collapsed | Cloudflare clearance escape hatch |
+
+Storage notes: "Store comic data locally" keeps a small cache so the panel opens instantly and works offline; turning it off clears cached data immediately and disables offline reads. "Archive past pull lists" snapshots each week's pulls while current, building browsable history over time (26 weeks kept). Archiving stays useful even when signed in as an offline fallback.
+
+Marks, profile, session cookie, and preferences persist in `~/.local/state/omarchy/settings/longbox.json`.
 
 ## Configure via shell.json
 
-Settings live in `~/.config/omarchy/shell.json` under the widget entry. These seed the initial state only; changes made in the panel's Settings tab take precedence afterward.
+Settings seed from `~/.config/omarchy/shell.json` under the widget entry on first run only; changes made in the panel's Settings tab take precedence afterward.
 
 | Key | Default | Description |
 |-----|---------|-------------|
 | `username` | *(empty)* | Your LoCG username; leave blank for general weekly releases |
 | `source` | `pulls` | `pulls` or `releases` (everything shipping that week) |
-| `excludeVariants` | `true` | Hide variant covers (releases mode only) |
-| `showCovers` | `true` | Cover thumbnails in the panel |
-| `refreshIntervalMin` | `60` | Fetch interval; be gentle, LoCG rate-limits |
+| `excludeVariants` | `true` | Hide variant covers (releases source only) |
+| `showCovers` | `true` | Cover thumbnails in comic lists |
+| `refreshIntervalMin` | `360` | Fetch interval in minutes (1h-12h); be gentle, LoCG rate-limits |
 
 ## Dependencies
 
-- [curl](https://curl.se/) (preinstalled on Omarchy) — used to fetch data from leagueofcomicgeeks.com over HTTPS. No other external commands are executed.
-- The test suite needs Node.js (`node --test`).
+- [curl](https://curl.se/) (preinstalled on Omarchy) - all network access happens through short-lived curl processes over HTTPS. No other external commands are executed.
+- Node.js for the test suite only.
+
+## How it fetches
+
+Anonymous pulls scrape the public profile page; releases use the same AJAX endpoint the LoCG website itself calls. Signed-in pull lists go through that endpoint with your session cookie for any dated week. All of these are undocumented surfaces and can change; if they do, Longbox tells you rather than showing a silently empty list.
 
 ## Known limitations
 
-- Pull lists are only public for the current week. Past weeks appear from your local archive once archiving has had time to collect them; nothing before installation is recoverable anonymously.
-- Marks are local to this device. Syncing them to a LoCG account would need an authenticated session.
-- Data comes from parsing the public page HTML; if LoCG changes their markup the widget will tell you rather than show an empty list.
+- Anonymous pull lists are only public for the current week. Past weeks need archiving (opt-in), or sign-in for live browsing.
+- Marks are local to this device and do not sync to LoCG yet.
+- Sessions expire on LoCG's side after some weeks; sign-in is manual by design since passwords are never stored.
+- Aggressive refreshing gets bot-checked by Cloudflare. The default 6-hour interval stays well under that; if it still bites, use the Advanced clearance escape hatch.
+
+## Roadmap
+
+Planned next, roughly in order:
+
+1. **Mark syncing** - push collected/read/wishlist taps to LoCG via the authenticated list endpoint when signed in, with local marks remaining the offline fallback.
+2. **Collection import** - read your existing LoCG collection state so glyphs reflect reality instead of starting empty.
+3. **Pull subscriptions from the widget** - subscribe to a series straight from the release sheet using the signed-in session.
 
 ## Development
 
@@ -65,7 +103,7 @@ Run the test suite (no dependencies beyond Node):
 node --test "tests/*.test.js"
 ```
 
-HTML fixtures under `tests/fixtures/` were captured from real LoCG pages and keep the parser honest.
+Fixtures under `tests/fixtures/` were captured from real LoCG pages and API responses and keep the parser honest. Highlights: `ajax-pulls-auth.json` is a real signed-in dated pull response; `ajax-anon-pulls.json` shows the anonymous/expired signature; `profile-pull-list.html` carries the numeric user id the sign-in flow needs.
 
 ## Remove
 

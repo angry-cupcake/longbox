@@ -12,13 +12,13 @@
 
 function emptyDoc() {
   return {
-    version: 1,
+    version: 2,
     profile: { username: "", validatedAt: 0 },
     settings: {
       source: "pulls",
       excludeVariants: true,
       showCovers: true,
-      refreshIntervalMin: 60,
+      refreshIntervalMin: 360,
       viewMode: "list",
       storeDataLocally: true,
       archivePulls: false
@@ -26,6 +26,10 @@ function emptyDoc() {
     marks: {},
     archive: {},
     cache: { weekKey: "", fetchedMs: 0, issues: [] },
+    // Opt-in LoCG sign-in. Only the session cookie is persisted - never the
+    // password. The session unlocks dated pull lists via the AJAX endpoint;
+    // it expires server-side after a few weeks and re-login is manual.
+    account: { session: "", userId: 0, name: "", signedInAt: 0 },
     // Cloudflare escape hatch: cf_clearance cookie pasted from the user's
     // browser plus the exact User-Agent it was issued to. Both must travel
     // together or Cloudflare rejects the clearance.
@@ -44,6 +48,8 @@ function isPlainObject(value) {
 function normalizeDoc(raw) {
   var doc = emptyDoc()
   if (!isPlainObject(raw)) return doc
+  var prevVersion = Number(raw.version)
+  if (!isFinite(prevVersion) || prevVersion < 1) prevVersion = 1
 
   if (isPlainObject(raw.profile)) {
     doc.profile.username = String(raw.profile.username || "").trim()
@@ -105,12 +111,63 @@ function normalizeDoc(raw) {
     doc.connection.userAgent = String(raw.connection.userAgent || "").trim()
   }
 
+  if (isPlainObject(raw.account)) {
+    doc.account.session = sanitizeCookieValue(raw.account.session)
+    doc.account.name = String(raw.account.name || "").trim()
+    var uid = Number(raw.account.userId)
+    doc.account.userId = isFinite(uid) && uid > 0 ? Math.floor(uid) : 0
+    var sia = Number(raw.account.signedInAt)
+    doc.account.signedInAt = isFinite(sia) && sia > 0 ? sia : 0
+  }
+
+  // v1 -> v2: the shipped default was 60 minutes; carry stale defaults to
+  // the new 6-hour one. Explicitly stored non-60 values pass through.
+  if (prevVersion < 2 && doc.settings.refreshIntervalMin === 60)
+    doc.settings.refreshIntervalMin = 360
+
   return doc
+}
+
+// Cookie values travel through shell argv (curl -b). Strip everything outside
+// the token charset so no value can smuggle quotes or separators.
+function sanitizeCookieValue(value) {
+  return String(value === undefined || value === null ? "" : value)
+    .replace(/[^\w\-+=.%~]/g, "")
+}
+
+function isSignedIn(doc) {
+  var account = isPlainObject(doc) ? doc.account : null
+  return !!account && account.session !== "" && account.userId > 0
+}
+
+// Merge a partial patch: setAccount(doc, { session, userId, name, signedInAt }).
+// Passing an empty session keeps identity fields but signs the user out.
+function setAccount(doc, patch) {
+  var next = normalizeDoc(doc)
+  if (!isPlainObject(patch)) return next
+  if (patch.session !== undefined) next.account.session = sanitizeCookieValue(patch.session)
+  if (patch.userId !== undefined) {
+    var uid = Number(patch.userId)
+    next.account.userId = isFinite(uid) && uid > 0 ? Math.floor(uid) : 0
+  }
+  if (patch.name !== undefined) next.account.name = String(patch.name || "").trim()
+  if (patch.signedInAt !== undefined) {
+    var sia = Number(patch.signedInAt)
+    next.account.signedInAt = isFinite(sia) && sia > 0 ? sia : 0
+  }
+  return next
+}
+
+// Forget the session entirely (Sign Out / hard reset).
+function clearAccount(doc) {
+  var next = normalizeDoc(doc)
+  next.account = emptyDoc().account
+  return next
 }
 
 function setConnection(doc, clearance, userAgent) {
   var next = normalizeDoc(doc)
-  next.connection.clearance = String(clearance || "").trim()
+  next.connection.clearance = sanitizeCookieValue(clearance)
   next.connection.userAgent = String(userAgent || "").trim()
   return next
 }

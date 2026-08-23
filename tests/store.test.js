@@ -8,14 +8,17 @@ const { loadPluginJs } = require('./lib/loadPluginJs.js')
 
 const S = loadPluginJs('Store.js', [
   'emptyDoc', 'normalizeDoc', 'setProfile', 'setSetting',
-  'markIssue', 'archiveIssues', 'pruneArchive', 'clearComicData', 'setConnection'
+  'markIssue', 'archiveIssues', 'pruneArchive', 'clearComicData', 'setConnection',
+  'setAccount', 'clearAccount', 'isSignedIn'
 ])
 
 const ISSUES = [{ id: '1', title: 'A' }, { id: '2', title: 'B' }]
 
 test('emptyDoc has no default profile and sane settings', () => {
   const doc = S.emptyDoc()
+  assert.equal(doc.version, 2)
   assert.equal(doc.profile.username, '')
+  assert.equal(doc.settings.refreshIntervalMin, 360)
   assert.equal(doc.settings.storeDataLocally, true)
   assert.equal(doc.settings.archivePulls, false)
   assert.deepEqual(doc.cache, { weekKey: '', fetchedMs: 0, issues: [] })
@@ -41,6 +44,19 @@ test('normalizeDoc clamps refresh interval and normalizes enums', () => {
 
   doc = S.normalizeDoc({ settings: { refreshIntervalMin: 99999 } })
   assert.equal(doc.settings.refreshIntervalMin, 720)
+})
+
+test('v1 docs migrate the old 60-minute default to 6h', () => {
+  let doc = S.normalizeDoc({ version: 1, settings: { refreshIntervalMin: 60 } })
+  assert.equal(doc.settings.refreshIntervalMin, 360)
+  // A v1 doc that picked a different interval keeps it.
+  doc = S.normalizeDoc({ version: 1, settings: { refreshIntervalMin: 120 } })
+  assert.equal(doc.settings.refreshIntervalMin, 120)
+  // v2 docs are never touched.
+  doc = S.normalizeDoc({ version: 2, settings: { refreshIntervalMin: 60 } })
+  assert.equal(doc.settings.refreshIntervalMin, 60)
+  // Migrated docs stamp the new version so migration runs once.
+  assert.equal(doc.version, 2)
 })
 
 test('markIssue merges facets and garbage-collects empty entries', () => {
@@ -112,6 +128,82 @@ test('documents survive a JSON round trip unchanged', () => {
   doc = S.markIssue(doc, '5', { collected: true, readAt: 9 })
   doc = S.archiveIssues(doc, '2026-08-26', ISSUES, { enabled: true })
 
+  const roundTripped = S.normalizeDoc(JSON.parse(JSON.stringify(doc)))
+  assert.deepEqual(roundTripped, doc)
+})
+
+// ------------------------------------------------------------------- account
+
+test('emptyDoc has a signed-out account section', () => {
+  const doc = S.emptyDoc()
+  assert.deepEqual(doc.account, { session: '', userId: 0, name: '', signedInAt: 0 })
+  assert.equal(S.isSignedIn(doc), false)
+})
+
+test('isSignedIn needs both a session and a user id', () => {
+  assert.equal(S.isSignedIn({ account: { session: 'tok', userId: 5 } }), true)
+  assert.equal(S.isSignedIn({ account: { session: '', userId: 5 } }), false)
+  assert.equal(S.isSignedIn({ account: { session: 'tok', userId: 0 } }), false)
+  assert.equal(S.isSignedIn({}), false)
+  assert.equal(S.isSignedIn(null), false)
+})
+
+test('normalizeDoc coerces and sanitizes the account section', () => {
+  let doc = S.normalizeDoc({ account: 'garbage' })
+  assert.deepEqual(doc.account, { session: '', userId: 0, name: '', signedInAt: 0 })
+
+  doc = S.normalizeDoc({
+    account: { session: ' abc123;bad ', userId: '-4', name: 42, signedInAt: 'x' }
+  })
+  // Cookie charset is stripped of shell-hostile characters.
+  assert.equal(doc.account.session, 'abc123bad')
+  assert.equal(doc.account.userId, 0)
+  assert.equal(doc.account.name, '42') // coerced like profile.username
+  assert.equal(doc.account.signedInAt, 0)
+
+  doc = S.normalizeDoc({
+    account: { session: 'tok', userId: 591452.9, name: 'cupcake', signedInAt: 1700000000000 }
+  })
+  assert.equal(doc.account.userId, 591452)
+  assert.equal(doc.account.name, 'cupcake')
+  assert.equal(doc.account.signedInAt, 1700000000000)
+})
+
+test('setAccount merges partial patches', () => {
+  let doc = S.setAccount(S.emptyDoc(), { session: 'tok', userId: 591452, name: 'cupcake' })
+  assert.equal(doc.account.session, 'tok')
+  assert.ok(!doc.account.signedInAt)
+
+  doc = S.setAccount(doc, { signedInAt: 99 })
+  assert.deepEqual(
+    doc.account,
+    { session: 'tok', userId: 591452, name: 'cupcake', signedInAt: 99 }
+  )
+
+  // Clearing just the session expires but keeps identity for UI copy.
+  doc = S.setAccount(doc, { session: '' })
+  assert.equal(S.isSignedIn(doc), false)
+  assert.equal(doc.account.name, 'cupcake')
+  assert.equal(doc.account.userId, 591452)
+})
+
+test('clearAccount resets only the account section', () => {
+  let doc = S.emptyDoc()
+  doc = S.setProfile(doc, 'alice', 1000)
+  doc = S.markIssue(doc, '9', { wishlist: true })
+  doc = S.archiveIssues(doc, '2026-08-26', ISSUES, { enabled: true })
+  doc = S.setAccount(doc, { session: 'tok', userId: 7, name: 'bob', signedInAt: 5 })
+
+  doc = S.clearAccount(doc)
+  assert.deepEqual(doc.account, { session: '', userId: 0, name: '', signedInAt: 0 })
+  assert.equal(doc.profile.username, 'alice')
+  assert.deepEqual(doc.marks['9'], { wishlist: true })
+  assert.ok(doc.archive['2026-08-26'])
+})
+
+test('account survives a JSON round trip unchanged', () => {
+  let doc = S.emptyDoc()
+  doc = S.setAccount(doc, { session: 'tok.en~x', userId: 12, name: 'zoe', signedInAt: 34 })
   const roundTripped = S.normalizeDoc(JSON.parse(JSON.stringify(doc)))
   assert.deepEqual(roundTripped, doc)
 })

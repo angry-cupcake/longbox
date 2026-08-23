@@ -26,11 +26,13 @@ function cleanText(value) {
 
 // Parse the new-comics listing HTML into an array of issue objects.
 // Non-variant issues carry data-parent="0"; variants are collapsed rows that
-// reference their parent via data-parent="<comicId>".
+// reference their parent via data-parent="<comicId>". Rows come in two
+// attribute orders: full pages emit <li class="issue" ...> while the AJAX
+// get_comics endpoint emits <li id="comic-<id>" class="issue" ...>.
 function parseReleases(html) {
   var issues = []
   if (!html || html.indexOf("<li") < 0) return issues
-  var blockRe = /<li class="issue[^"]*"[^>]*>([\s\S]*?)<\/li>/g
+  var blockRe = /<li(?=[^>]*class="issue)[^>]*>([\s\S]*?)<\/li>/g
   var m
   while ((m = blockRe.exec(html)) !== null) {
     var openTag = m[0].slice(0, m[0].indexOf(">") + 1)
@@ -47,7 +49,9 @@ function parseReleases(html) {
     var titleMatch = /class="title[^"]*"[^>]*>\s*<a[^>]*>([\s\S]*?)<\/a>/.exec(body)
     if (!titleMatch) continue
 
-    var publisherMatch = /class="publisher[^"]*">([\s\S]*?)<\/div>/.exec(body)
+    // Publisher text is plain; stop at the first tag close. The container
+    // differs between surfaces (div on pages, span on API lists).
+    var publisherMatch = /class="publisher[^"]*">\s*([^<]+)/.exec(body)
     var dateMatch = /data-date="(-?\d+)"/.exec(body)
     var priceMatch = /\$\s?([\d.]+)/.exec(body)
     var coverMatch = /data-src="([^"]+\/covers\/[^"]+)"/.exec(body)
@@ -104,13 +108,12 @@ function formatPulls(count) {
   return String(count)
 }
 
-// Build the fetch URL for a LoCG source.
-// NOTE: Only the un-dated profile page serves pull-list data publicly;
-// dated URLs (/pull-list/YYYY/MM/DD) return empty lists without a login
-// session. Releases pages, however, serve any week publicly at
-// /comics/new-comics/YYYY/MM/DD (verified 2026-08), so week navigation is
-// anchored to a server-provided week timestamp and only releases fetches
-// get dated URLs.
+// Build the fetch URL for the anonymous HTML surfaces: a public profile's
+// pull-list page, or the weekly release sheet. These pages resolve the
+// current week on their own, and dated release URLs serve any week.
+// NOTE: dated profile pages return empty lists without a login session -
+// anonymous pulls can only ever see the current week. Signed-in users get
+// dated pull lists from ajaxUrl() instead of this scraper.
 function feedUrl(username, source, anchorTsMs, weekOffset) {
   var user = cleanText(username)
   if (source !== "releases" && user !== "")
@@ -185,6 +188,131 @@ function diagnose(html) {
   if (count > 0)
     return { status: "ok", count: count }
   return { status: "suspect", count: 0 }
+}
+
+// ---------------------------------------------------------------------------
+// AJAX endpoint (undocumented). The site's own web UI populates its lists by
+// calling /comic/get_comics, which answers with a JSON envelope:
+//   { count: <n>, list: "<div id='comic-list-block'...><li ...>...</li>...",
+//     configurator: { echoed params, incl. user_id }, statbar, filters_* }
+// Releases work anonymously. Pull lists (list=1) are session-gated: without
+// a ci_session cookie the server ignores user_id and echoes user_id 0.
+// ---------------------------------------------------------------------------
+
+// Build a get_comics URL.
+//   source "pulls" + userId > 0  -> the signed-in user's pull list
+//   anything else                -> the public weekly release sheet
+// Unlike the HTML pages, the API does NOT resolve "current week" on its own:
+// a missing date param falls back to the epoch week. Always send one - the
+// cached anchor when it is fresh enough to trust, otherwise the computed
+// Wednesday-dated week containing now.
+function ajaxUrl(source, userId, anchorTsMs, weekOffset, nowMs) {
+  var params = ""
+  var uid = Math.floor(Number(userId) || 0)
+  if (source === "pulls" && uid > 0)
+    params = "list=1&list_option=thumbs&view=list&user_id=" + encodeURIComponent(String(uid))
+  else
+    params = "list=releases&list_option=thumbs&view=list"
+  var off = Math.floor(Number(weekOffset) || 0)
+  var now = Number(nowMs) || 0 || Date.now()
+  var base = (anchorTsMs && Math.abs(now - anchorTsMs) < 6 * 86400000)
+    ? anchorTsMs
+    : currentWeekTs(now)
+  params += "&date=" + weekKeyOf(shiftWeekTs(base, off)) + "&date_type=week"
+  return "https://leagueofcomicgeeks.com/comic/get_comics?" + params
+}
+
+// Epoch-ms of the Wednesday-dated release week that `nowMs` falls into,
+// UTC-based like all other week math here. Weeks run Sunday to Saturday but
+// carry the Wednesday label: on Sunday Aug 23 the site already shows the
+// Aug 26 sheet, and Thursday Aug 27 still belongs to it.
+function currentWeekTs(nowMs) {
+  var d = new Date(nowMs === undefined ? Date.now() : nowMs)
+  var utcDay = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()))
+  return utcDay.getTime() - utcDay.getUTCDay() * 86400000 + 3 * 86400000
+}
+
+// Parse a get_comics JSON envelope. Returns null for anything that is not
+// an envelope-shaped object (HTML pages, challenge interstitials, garbage).
+function parseAjaxEnvelope(text) {
+  var raw = String(text === undefined || text === null ? "" : text).trim()
+  if (raw === "" || raw.charAt(0) !== "{") return null
+  try {
+    var env = JSON.parse(raw)
+    if (env && typeof env.list === "string") return env
+  } catch (e) { /* not JSON */ }
+  return null
+}
+
+// Issues from a get_comics response body. Safe on every input.
+function parseAjaxList(text) {
+  var env = parseAjaxEnvelope(text)
+  return env ? parseReleases(env.list) : []
+}
+
+// Classify a get_comics response before trusting it. Mirrors diagnose():
+//   ok      - parsed at least one issue
+//   nolists - valid envelope, zero issues (empty week or empty pull list)
+//   suspect - envelope claims issues exist but none parsed (markup drift),
+//             or the endpoint answered with something that is not JSON
+//   challenge - Cloudflare interstitial
+//   empty   - nothing meaningful came back
+function classifyAjax(text) {
+  var raw = String(text === undefined || text === null ? "" : text)
+  if (raw.trim() === "") return { status: "empty", count: 0 }
+  if (/<title>\s*(just a moment|attention required)[^<]*<\/title>/i.test(raw) ||
+      /(_cf_chl|cf_chl_)[a-z_]*/i.test(raw))
+    return { status: "challenge", count: 0 }
+  var env = parseAjaxEnvelope(raw)
+  if (!env) return { status: "suspect", count: 0 }
+  var parsed = parseReleases(env.list)
+  var reported = Number(env.count)
+  var count = isFinite(reported) && reported > 0 ? reported : parsed.length
+  if (parsed.length > 0) return { status: "ok", count: parsed.length }
+  if (count > 0) return { status: "suspect", count: count }
+  return { status: "nolists", count: 0 }
+}
+
+// Which user does the server think is asking? Unreliable: the echo follows
+// request parameters (and cache state), not the session - verified to differ
+// between identical anonymous requests. Do not use for auth decisions.
+
+// Numeric id from a public profile page's comic-list-block. Used after
+// sign-in to learn the account id for API calls.
+function extractProfileUserId(html) {
+  var text = String(html === undefined || html === null ? "" : html)
+  var m = /id="comic-list-block"[^>]*data-user="(\d+)"/.exec(text)
+  if (!m) m = /data-user="(\d+)"/.exec(text)
+  return m ? Number(m[1]) : 0
+}
+
+// Signature of an anonymous pull-list answer: first-person zero state plus
+// a data-user of 0. Together they mean the server ignored our session.
+function looksAnonymousPull(text) {
+  var raw = String(text === undefined || text === null ? "" : text)
+  return /You don&#39;t have any comics pulled|You don't have any comics pulled/i.test(raw) &&
+    /data-user="0"/.test(raw)
+}
+
+// Pull the ci_session cookie out of a `curl -i` header dump. Redirect chains
+// produce several header blocks; the first Set-Cookie that grants a session
+// wins.
+function extractCiSession(responseText) {
+  var re = /set-cookie:\s*ci_session=([^;\r\n]+)/gi
+  var m
+  while ((m = re.exec(String(responseText === undefined || responseText === null ? "" : responseText))) !== null) {
+    var value = m[1].trim()
+    if (value !== "") return value
+  }
+  return ""
+}
+
+// Human-readable failure from a login page body ("Invalid username or
+// password..."). Empty string means no error block was found.
+function loginErrorFromHtml(bodyText) {
+  var m = /class="[^"]*alert-error[^"]*"[^>]*>([\s\S]*?)<\/div>/.exec(
+    String(bodyText === undefined || bodyText === null ? "" : bodyText))
+  return m ? cleanText(m[1].replace(/<[^>]+>/g, " ")) : ""
 }
 
 // NOTE: This file must not reference undeclared globals (e.g. `module`):
