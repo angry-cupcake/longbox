@@ -70,7 +70,7 @@
         "min": 60,
         "max": 720,
         "step": 60,
-        "defaultValue": 60
+        "defaultValue": 360
       }
     ]
   }
