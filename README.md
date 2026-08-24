@@ -38,7 +38,7 @@ The League of Comic Geeks section can sign you in. Anonymous access always works
 - **Live history**: your pull list loads from LoCG's API for any past or future week - no waiting for the local archive to accumulate.
 - **Resilience**: if a live fetch fails while browsing history, an archived snapshot is shown automatically when one exists.
 
-Security model: your password is used once for the sign-in request and never written anywhere - not even to disk in memory dumps of the process list, since it travels through the process environment rather than command-line arguments. Only the resulting session cookie is stored, in a state file kept owner-only (`chmod 600`). LoCG expires sessions after a while; when that happens Longbox quietly falls back to anonymous mode and asks you to sign in again.
+Security model: your password is used once for the sign-in request and never written anywhere - not even to disk or to the process list, since it and your session cookies are passed to curl through a configuration file fed over standard input, never through command-line arguments visible in `/proc/<pid>/cmdline` or through environment variables. Only the resulting session cookie is stored, in a state file kept owner-only (`chmod 600`). LoCG expires sessions after a while; when that happens Longbox quietly falls back to anonymous mode and asks you to sign in again.
 
 ### Marks
 
