@@ -90,9 +90,8 @@ Panel {
   }).length
   readonly property string barCount: needsSetup ? "" : (liveCount > 0 ? String(liveCount) : "")
 
-  // Cookie flags for curl. Values are charset-sanitized in Store.js, so each
-  // pair is a single shell-safe word; repeated -b flags merge into one jar.
-  function cookieArgs(sessionOverride) {
+  // Cookie strings for the curl config, in jar order: clearance first.
+  function configCookieList(sessionOverride) {
     var cookies = []
     var clearance = String(doc.connection.clearance || "")
     if (clearance !== "") cookies.push("cf_clearance=" + clearance)
@@ -101,13 +100,21 @@ Panel {
     } else if (signedIn) {
       cookies.push("ci_session=" + doc.account.session)
     }
-    var args = []
-    for (var i = 0; i < cookies.length; i++) args.push("-b", cookies[i])
-    return args
+    return cookies
   }
 
-  function curlArgs() {
-    return cookieArgs()
+  // Feed a curl invocation its full configuration over stdin (`curl -K -`) so
+  // no secret ever appears in a process command line or environment: argv is
+  // world-readable via /proc/<pid>/cmdline for the process's whole lifetime.
+  // The config text lives only here and in the kernel pipe. This install has
+  // no closeStdin(), but setting stdinEnabled back to false calls
+  // QProcess::closeWriteChannel(), which delivers EOF and lets -K - finish.
+  function runCurl(procObj, opts) {
+    procObj.command = ["/usr/bin/env", "curl", "-K", "-"]
+    procObj.stdinEnabled = true
+    procObj.running = true
+    procObj.write(Model.buildCurlConfig(opts))
+    procObj.stdinEnabled = false
   }
 
   // Route per auth state: signed-in pulls come from the AJAX API for any
@@ -212,7 +219,7 @@ Panel {
 
   // ----------------------------------------------------------------- fetching
   // Cloudflare clearance (and, when signed in, the account session) travel
-  // with every request; see cookieArgs() above.
+  // with every request; see configCookieList() above.
 
   function startRefresh(isAutoRetry) {
     if (fetchProcess.running) return
@@ -220,10 +227,12 @@ Panel {
     loading = true
     fetchIsRetry = isAutoRetry === true
     loadError = ""
-    fetchProcess.command = ["/usr/bin/env", "curl", "-sL", "--max-time", "25",
-      "--max-filesize", String(Model.RESPONSE_BYTE_LIMIT),
-      "-A", root.httpAgent].concat(curlArgs(), [fetchUrl()])
-    fetchProcess.running = true
+    runCurl(fetchProcess, {
+      userAgent: root.httpAgent,
+      cookies: configCookieList(),
+      url: fetchUrl(),
+      maxTime: 25
+    })
   }
 
   function finishRefresh() {
@@ -370,10 +379,12 @@ Panel {
     validatingProfile = true
     profileStatus = "Checking " + name + "..."
     validateProcess.profileUsername = name
-    validateProcess.command = ["/usr/bin/env", "curl", "-sL", "--max-time", "20",
-      "--max-filesize", String(Model.RESPONSE_BYTE_LIMIT),
-      "-A", root.httpAgent].concat(curlArgs(),
-      ["https://leagueofcomicgeeks.com/profile/" + encodeURIComponent(name)])
+    runCurl(validateProcess, {
+      userAgent: root.httpAgent,
+      cookies: configCookieList(),
+      url: "https://leagueofcomicgeeks.com/profile/" + encodeURIComponent(name),
+      maxTime: 20
+    })
     console.warn("[longbox] validate: starting for", name)
     validateProcess.running = true
     validateWatchdog.restart()
@@ -439,22 +450,17 @@ Panel {
     signingIn = true
     loginStatus = "Signing in as " + name + "..."
     pendingName = name
-    // Credentials travel via environment, never argv: process command lines
-    // are world-readable, environ is not.
-    loginProcess.environment = ({
-      LONGBOX_USER: name,
-      LONGBOX_PASS: pass,
-      LONGBOX_AGENT: root.httpAgent,
-      LONGBOX_COOKIES: cookieArgs("").join(" ")
+    // Credentials travel through the curl config fed on stdin - never argv
+    // (world-readable in /proc/<pid>/cmdline) and never the environment.
+    // Response headers are kept so Set-Cookie can be mined below.
+    runCurl(loginProcess, {
+      userAgent: root.httpAgent,
+      cookies: configCookieList(""),
+      url: "https://leagueofcomicgeeks.com/login",
+      includeHeaders: true,
+      formFields: { username: name, password: pass },
+      maxTime: 25
     })
-    loginProcess.command = ["/bin/sh", "-c",
-      "exec curl -siL --max-time 25 --max-filesize " + Model.RESPONSE_BYTE_LIMIT +
-      " -A \"$LONGBOX_AGENT\" $LONGBOX_COOKIES" +
-      " --data-urlencode \"username=$LONGBOX_USER\"" +
-      " --data-urlencode \"password=$LONGBOX_PASS\"" +
-      " \"https://leagueofcomicgeeks.com/login\"",
-      "longbox-login"]
-    loginProcess.running = true
     loginWatchdog.restart()
   }
 
@@ -488,10 +494,12 @@ Panel {
     signingIn = true
     // Learn the numeric account id from the public profile page - reliable,
     // unlike the API's user echo which follows request params, not sessions.
-    whoamiProcess.command = ["/usr/bin/env", "curl", "-sL", "--max-time", "20",
-      "-A", root.httpAgent].concat(cookieArgs(session),
-      ["https://leagueofcomicgeeks.com/profile/" + encodeURIComponent(username) + "/pull-list"])
-    whoamiProcess.running = true
+    runCurl(whoamiProcess, {
+      userAgent: root.httpAgent,
+      cookies: configCookieList(pendingSession),
+      url: "https://leagueofcomicgeeks.com/profile/" + encodeURIComponent(username) + "/pull-list",
+      maxTime: 20
+    })
     whoamiWatchdog.restart()
     loginStatus = "Signed in as " + username + ", loading your lists..."
   }
