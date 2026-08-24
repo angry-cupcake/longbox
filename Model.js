@@ -341,6 +341,41 @@ function loginErrorFromHtml(bodyText) {
   return m ? cleanText(m[1].replace(/<[^>]+>/g, " ")) : ""
 }
 
+// ---------------------------------------------------------------------------
+// Curl configuration builder (`curl -K -`). Everything secret-bearing travels
+// through this config text instead of command-line arguments: argv is
+// world-readable via /proc/<pid>/cmdline for the life of the process, while
+// this text lives only in memory and a kernel pipe between Quickshell and curl.
+// ---------------------------------------------------------------------------
+
+// Percent-encode a form field value the way --data-urlencode would.
+// encodeURIComponent never emits quotes, backslashes, or newlines, so the
+// result is always safe to embed in a double-quoted curl-config value.
+function formEncode(value) {
+  return encodeURIComponent(String(value === undefined || value === null ? "" : value))
+}
+
+// Build the body of a curl config (for `curl -K -`) that carries everything
+// sensitive: cookies, user agent, and optionally login form fields.
+// options: { userAgent, cookies: ["name=val", ...], url,
+//            formFields: { name: value } (optional, implies POST-style data),
+//            includeHeaders (login needs response headers to mine Set-Cookie) }
+// Values MUST already be charset-sanitized by callers (Store.js).
+function buildCurlConfig(options) {
+  var o = options || {}
+  var lines = ["silent", "location"]
+  if (o.includeHeaders) lines.push("include")
+  if (o.maxTime) lines.push('max-time = "' + Number(o.maxTime) + '"')
+  lines.push('max-filesize = "' + String(RESPONSE_BYTE_LIMIT) + '"')
+  if (o.userAgent) lines.push('user-agent = "' + o.userAgent + '"')
+  if (o.cookies && o.cookies.length > 0)
+    lines.push('cookie = "' + o.cookies.join("; ") + '"')
+  if (o.url) lines.push('url = "' + o.url + '"')
+  for (var name in (o.formFields || {}))
+    lines.push('data-urlencode = "' + name + "=" + formEncode(o.formFields[name]) + '"')
+  return lines.join("\n") + "\n"
+}
+
 // NOTE: This file must not reference undeclared globals (e.g. `module`):
 // QML's JS engine throws ReferenceError at script-evaluation time for them.
 // For Node-based tests, use the loader in tests/lib/loadPluginJs.js.

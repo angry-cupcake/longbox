@@ -15,7 +15,8 @@ const M = loadPluginJs('Model.js', [
   'ymdParts', 'weekKeyOf', 'shiftWeekTs', 'ymdPath', 'diagnose',
   'ajaxUrl', 'parseAjaxEnvelope', 'parseAjaxList', 'classifyAjax',
   'extractProfileUserId', 'looksAnonymousPull', 'extractCiSession', 'loginErrorFromHtml',
-  'currentWeekTs', 'isSizeOverflow', 'transferFailed', 'RESPONSE_BYTE_LIMIT'
+  'currentWeekTs', 'isSizeOverflow', 'transferFailed', 'RESPONSE_BYTE_LIMIT',
+  'formEncode', 'buildCurlConfig'
 ])
 
 const fixture = (name) => fs.readFileSync(path.join(__dirname, 'fixtures', name), 'utf8')
