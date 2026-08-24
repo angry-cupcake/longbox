@@ -348,3 +348,50 @@ test('loginErrorFromHtml extracts the alert block', () => {
   assert.match(err, /Invalid Username and\/or Password/)
   assert.equal(M.loginErrorFromHtml(fixture('releases-current.html')), '')
 })
+
+// ------------------------------------------------------- curl config builder
+
+test('buildCurlConfig emits flag lines, agent, and merged cookies', () => {
+  const cfg = M.buildCurlConfig({
+    userAgent: 'Mozilla/5.0',
+    cookies: ['cf_clearance=abc', 'ci_session=def'],
+    url: 'https://leagueofcomicgeeks.com/comics/new-comics',
+    maxTime: 25
+  })
+  assert.ok(cfg.endsWith('\n'), 'config must end with a newline')
+  assert.ok(cfg.includes('user-agent = "Mozilla/5.0"'))
+  // Multiple cookies merge into one jar on a single cookie line.
+  assert.equal(cfg.match(/cookie = ".*"/g).length, 1)
+  assert.ok(cfg.includes('cookie = "cf_clearance=abc; ci_session=def"'))
+  assert.ok(cfg.includes('url = "https://leagueofcomicgeeks.com/comics/new-comics"'))
+  assert.ok(cfg.includes('max-time = "25"'))
+  assert.ok(cfg.includes('max-filesize = "' + M.RESPONSE_BYTE_LIMIT + '"'))
+  assert.ok(/(^|\n)silent(\n|$)/.test(cfg) && /(^|\n)location(\n|$)/.test(cfg))
+})
+
+test('formEncode never emits quoting hazards', () => {
+  const nasty = 'a"b\\c\nd&e=f%g h'
+  const enc = M.formEncode(nasty)
+  assert.doesNotMatch(enc, /["\\\n]/)
+  assert.equal(M.formEncode('a"b\\c'), 'a%22b%5Cc')
+  assert.equal(M.formEncode('&=% '), '%26%3D%25%20')
+  assert.equal(M.formEncode(undefined), '')
+  assert.equal(M.formEncode(null), '')
+})
+
+test('buildCurlConfig keeps form values safely inside the quotes', () => {
+  const nasty = 'p@ss"with\\backslash\nand&amp'
+  const cfg = M.buildCurlConfig({
+    url: 'https://leagueofcomicgeeks.com/login',
+    formFields: { username: 'alice', password: nasty }
+  })
+  const dataLines = cfg.split('\n').filter((l) => l.startsWith('data-urlencode = '))
+  assert.equal(dataLines.length, 2)
+  for (const line of dataLines) {
+    // Each line is exactly one quoted value: quote, hazard-free body, quote.
+    assert.match(line, /^data-urlencode = "[^"]*"$/)
+    assert.ok(!/[^\\]"/.test(line.slice(19, -1)), 'no unescaped quote inside value')
+  }
+  assert.ok(dataLines.some((l) => l.includes('username=alice')))
+  assert.ok(dataLines.some((l) => l.includes('password=' + M.formEncode(nasty))))
+})
