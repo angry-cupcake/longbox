@@ -236,6 +236,15 @@ Panel {
       loadError = "League of Comic Geeks sent an oversized response - refusing to read it."
       return
     }
+    // Any other curl failure (timeout, reset, ...) may still have left a
+    // parseable fragment behind. Refuse the whole transfer: caching a
+    // truncated week would poison cache and archive alike.
+    if (Model.transferFailed(fetchExitCode)) {
+      fetchIsRetry = false
+      if (!showArchiveFallback())
+        loadError = "Could not reach League of Comic Geeks."
+      return
+    }
     var body = fetchStdout.text
     var usesAjax = signedIn || source === "releases"
     var verdict = usesAjax ? Model.classifyAjax(body) : Model.diagnose(body)
@@ -252,11 +261,6 @@ Panel {
       return
     }
     fetchIsRetry = false
-
-    if (verdict.status === "empty" && fetchExitCode !== 0) {
-      if (!showArchiveFallback()) loadError = "Could not reach League of Comic Geeks."
-      return
-    }
 
     if (usesAjax) finishAjax(verdict, body)
     else finishHtml(verdict, body)
@@ -463,6 +467,10 @@ Panel {
       loginStatus = "Sign-in failed - the site returned an oversized response. Try again shortly."
       return
     }
+    if (Model.transferFailed(exitCode)) {
+      loginStatus = "Sign-in failed - the connection dropped mid-request. Try again shortly."
+      return
+    }
     var out = loginStdout.text
     var session = Model.extractCiSession(out)
     var errText = Model.loginErrorFromHtml(out)
@@ -495,6 +503,10 @@ Panel {
     // missing or mangled, so refuse the sign-in commit.
     if (Model.isSizeOverflow(exitCode)) {
       loginStatus = "Could not confirm the session - the profile page came back oversized. Try again."
+      return
+    }
+    if (Model.transferFailed(exitCode)) {
+      loginStatus = "Could not confirm the session - connection trouble. Try again in a moment."
       return
     }
     var uid = Model.extractProfileUserId(whoamiStdout.text)

@@ -15,7 +15,7 @@ const M = loadPluginJs('Model.js', [
   'ymdParts', 'weekKeyOf', 'shiftWeekTs', 'ymdPath', 'diagnose',
   'ajaxUrl', 'parseAjaxEnvelope', 'parseAjaxList', 'classifyAjax',
   'extractProfileUserId', 'looksAnonymousPull', 'extractCiSession', 'loginErrorFromHtml',
-  'currentWeekTs', 'isSizeOverflow', 'RESPONSE_BYTE_LIMIT'
+  'currentWeekTs', 'isSizeOverflow', 'transferFailed', 'RESPONSE_BYTE_LIMIT'
 ])
 
 const fixture = (name) => fs.readFileSync(path.join(__dirname, 'fixtures', name), 'utf8')
@@ -249,6 +249,15 @@ test('isSizeOverflow flags only the curl byte-cap exit code', () => {
   assert.equal(M.isSizeOverflow(56), false)
   assert.equal(M.isSizeOverflow(undefined), false)
   assert.equal(M.isSizeOverflow(null), false)
+})
+
+test('transferFailed flags every nonzero exit code', () => {
+  assert.equal(M.transferFailed(0), false)
+  assert.equal(M.transferFailed(28), true)   // timeout
+  assert.equal(M.transferFailed(6), true)    // could not resolve host
+  assert.equal(M.transferFailed(63), true)   // byte cap (also caught upstream)
+  assert.equal(M.transferFailed('7'), true)
+  assert.equal(M.transferFailed(undefined), true) // missing code cannot be trusted
 })
 
 test('extractProfileUserId reads the id off a public profile page', () => {

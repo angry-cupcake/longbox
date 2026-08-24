@@ -187,6 +187,13 @@ function isSizeOverflow(exitCode) {
   return Number(exitCode) === 63
 }
 
+// True when the transfer itself failed (timeout, DNS, reset, truncated by
+// the byte cap, ...). Partial output may still be parseable - callers must
+// refuse it rather than classify whatever fragments arrived.
+function transferFailed(exitCode) {
+  return Number(exitCode) !== 0
+}
+
 // Classify a fetched response before trusting it.
 //   ok         - parsed at least one issue
 //   challenge  - Cloudflare interstitial ("Just a moment..."); retry may help
