@@ -191,6 +191,7 @@ Panel {
   }
 
   function commit(nextDoc) {
+    if (persistenceBlocked) return
     doc = nextDoc
     try {
       stateFile.setText(JSON.stringify(doc))
@@ -541,18 +542,62 @@ Panel {
     else startRefresh()
   }
 
-  // The state doc holds a bearer cookie; keep the file owner-only. Atomic
-  // writes recreate the inode, so re-assert after each commit.
+  // The state doc holds a bearer cookie, so it must provably stay
+  // owner-only. Atomic writes recreate the inode (permissions come from the
+  // umask), so after every write a paranoid helper re-opens the path by fd:
+  // O_NOFOLLOW refuses planted symlinks, then type and owner are checked and
+  // 600 is fchmodded onto the very inode that was verified - never the path.
   Process {
     id: permsProcess
     running: false
+
+    stdout: StdioCollector {
+      id: permsStdout
+      waitForEnd: true
+    }
+
+    onExited: function(exitCode) {
+      root.finishEnsurePerms(exitCode)
+    }
   }
 
   function ensureStatePerms() {
     if (permsProcess.running) return
-    permsProcess.command = ["/usr/bin/chmod", "600",
+    // One argv element for the script so its text can be extracted and
+    // behavior-tested verbatim from tests/state-hardening.test.js.
+    permsProcess.command = ["/usr/bin/python3", "-c",
+      "import json, os, stat, sys\n" +
+      "p = os.path.expanduser(sys.argv[1])\n" +
+      "try:\n" +
+      "    fd = os.open(p, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)\n" +
+      "except OSError as e:\n" +
+      "    print(\"refused:\" + e.strerror); sys.exit(1)\n" +
+      "st = os.fstat(fd)\n" +
+      "if not stat.S_ISREG(st.st_mode):\n" +
+      "    print(\"refused:not-regular\"); sys.exit(1)\n" +
+      "if st.st_uid != os.getuid():\n" +
+      "    print(\"refused:not-owner\"); sys.exit(1)\n" +
+      "os.fchmod(fd, 0o600)\n" +
+      "print(\"ok\")",
       Quickshell.env("HOME") + "/.local/state/omarchy/settings/longbox.json"]
     permsProcess.running = true
+  }
+
+  // Fail closed: a state file we cannot prove is private must never receive
+  // another secret. Strip credentials from memory and stop persisting; the
+  // user sees why instead of silent dead storage.
+  property bool persistenceBlocked: false
+
+  function finishEnsurePerms(exitCode) {
+    if (exitCode === 0 && permsStdout.text.indexOf("ok") >= 0) return
+    // Ordering choice: strip-and-write FIRST via the normal commit() while
+    // persistenceBlocked is still false, THEN arm the guard. The secrets
+    // land on disk only inside this last write; every later commit is
+    // refused by commit()'s guard. Marks/preferences loss after a block is
+    // acceptable; secret retention is not.
+    commit(Store.setAccount(Store.setConnection(doc, "", ""), { session: "" }))
+    persistenceBlocked = true
+    loginStatus = "Longbox stopped saving data: the state file failed a privacy check (symlink or wrong owner?). Fix ~/.local/state/omarchy/settings/longbox.json and restart."
   }
 
   Process {
