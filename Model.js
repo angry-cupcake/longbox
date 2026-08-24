@@ -168,6 +168,25 @@ function ymdPath(tsMs) {
   return p.y + "/" + p.m + "/" + p.d
 }
 
+// ---------------------------------------------------------------------------
+// Response trust boundary
+// ---------------------------------------------------------------------------
+
+// Hard ceiling for any single remote response, enforced producer-side by
+// curl's --max-filesize flag (curl aborts mid-transfer once received bytes
+// exceed the limit, even when no Content-Length was announced - behaviour
+// reliable since curl 8.4). Far above any real LoCG page; exists only so a
+// compromised or hostile upstream cannot balloon the long-lived shell's
+// memory before parsing starts.
+var RESPONSE_BYTE_LIMIT = 2 * 1024 * 1024
+
+// True when a transfer died because it hit RESPONSE_BYTE_LIMIT (curl exit
+// code 63, CURLE_FILESIZE_EXCEEDED). Whatever reached the collector is
+// truncated mid-tag/mid-record: callers must fail closed, never parse it.
+function isSizeOverflow(exitCode) {
+  return Number(exitCode) === 63
+}
+
 // Classify a fetched response before trusting it.
 //   ok         - parsed at least one issue
 //   challenge  - Cloudflare interstitial ("Just a moment..."); retry may help

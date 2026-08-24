@@ -15,7 +15,7 @@ const M = loadPluginJs('Model.js', [
   'ymdParts', 'weekKeyOf', 'shiftWeekTs', 'ymdPath', 'diagnose',
   'ajaxUrl', 'parseAjaxEnvelope', 'parseAjaxList', 'classifyAjax',
   'extractProfileUserId', 'looksAnonymousPull', 'extractCiSession', 'loginErrorFromHtml',
-  'currentWeekTs'
+  'currentWeekTs', 'isSizeOverflow', 'RESPONSE_BYTE_LIMIT'
 ])
 
 const fixture = (name) => fs.readFileSync(path.join(__dirname, 'fixtures', name), 'utf8')
@@ -233,6 +233,22 @@ test('parseAjaxList is safe on every input shape', () => {
   assert.deepEqual(M.parseAjaxList(''), [])
   assert.deepEqual(M.parseAjaxList('garbage{'), [])
   assert.deepEqual(M.parseAjaxList('{"list":123}'), [])
+})
+
+test('response byte cap is finite and generous for real LoCG pages', () => {
+  assert.ok(M.RESPONSE_BYTE_LIMIT >= 1024 * 1024, 'must not clip real pages')
+  assert.ok(M.RESPONSE_BYTE_LIMIT <= 16 * 1024 * 1024, 'must actually bound memory')
+})
+
+test('isSizeOverflow flags only the curl byte-cap exit code', () => {
+  assert.equal(M.isSizeOverflow(63), true)
+  assert.equal(M.isSizeOverflow('63'), true)
+  // Success, timeout, network failure: normal classification paths.
+  assert.equal(M.isSizeOverflow(0), false)
+  assert.equal(M.isSizeOverflow(28), false)
+  assert.equal(M.isSizeOverflow(56), false)
+  assert.equal(M.isSizeOverflow(undefined), false)
+  assert.equal(M.isSizeOverflow(null), false)
 })
 
 test('extractProfileUserId reads the id off a public profile page', () => {

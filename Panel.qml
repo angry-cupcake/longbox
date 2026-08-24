@@ -221,12 +221,21 @@ Panel {
     fetchIsRetry = isAutoRetry === true
     loadError = ""
     fetchProcess.command = ["/usr/bin/env", "curl", "-sL", "--max-time", "25",
+      "--max-filesize", String(Model.RESPONSE_BYTE_LIMIT),
       "-A", root.httpAgent].concat(curlArgs(), [fetchUrl()])
     fetchProcess.running = true
   }
 
   function finishRefresh() {
     loading = false
+    // The byte cap tripped: the collector holds a body cut off mid-tag or
+    // mid-record. Refuse it outright instead of letting the classifiers
+    // guess at fragments.
+    if (Model.isSizeOverflow(fetchExitCode)) {
+      fetchIsRetry = false
+      loadError = "League of Comic Geeks sent an oversized response - refusing to read it."
+      return
+    }
     var body = fetchStdout.text
     var usesAjax = signedIn || source === "releases"
     var verdict = usesAjax ? Model.classifyAjax(body) : Model.diagnose(body)
@@ -358,6 +367,7 @@ Panel {
     profileStatus = "Checking " + name + "..."
     validateProcess.profileUsername = name
     validateProcess.command = ["/usr/bin/env", "curl", "-sL", "--max-time", "20",
+      "--max-filesize", String(Model.RESPONSE_BYTE_LIMIT),
       "-A", root.httpAgent].concat(curlArgs(),
       ["https://leagueofcomicgeeks.com/profile/" + encodeURIComponent(name)])
     console.warn("[longbox] validate: starting for", name)
@@ -384,6 +394,14 @@ Panel {
   function finishProfileValidation(exitCode) {
     validateWatchdog.stop()
     validatingProfile = false
+    // Byte cap tripped: the page is truncated mid-markup, so neither the
+    // challenge nor the missing-profile verdicts below would be honest.
+    if (Model.isSizeOverflow(exitCode)) {
+      console.warn("[longbox] validate: response exceeded byte cap")
+      profileValid = false
+      profileStatus = "The profile check hit a response size limit. Try again."
+      return
+    }
     var body = validateStdout.text
     var name = validateProcess.profileUsername
     var verdict = Model.diagnose(body)
@@ -426,7 +444,8 @@ Panel {
       LONGBOX_COOKIES: cookieArgs("").join(" ")
     })
     loginProcess.command = ["/bin/sh", "-c",
-      "exec curl -siL --max-time 25 -A \"$LONGBOX_AGENT\" $LONGBOX_COOKIES" +
+      "exec curl -siL --max-time 25 --max-filesize " + Model.RESPONSE_BYTE_LIMIT +
+      " -A \"$LONGBOX_AGENT\" $LONGBOX_COOKIES" +
       " --data-urlencode \"username=$LONGBOX_USER\"" +
       " --data-urlencode \"password=$LONGBOX_PASS\"" +
       " \"https://leagueofcomicgeeks.com/login\"",
@@ -435,9 +454,15 @@ Panel {
     loginWatchdog.restart()
   }
 
-  function finishSignIn(username) {
+  function finishSignIn(username, exitCode) {
     loginWatchdog.stop()
     signingIn = false
+    // Byte cap tripped: the header/body dump is truncated - no reliable
+    // Set-Cookie can be mined from it.
+    if (Model.isSizeOverflow(exitCode)) {
+      loginStatus = "Sign-in failed - the site returned an oversized response. Try again shortly."
+      return
+    }
     var out = loginStdout.text
     var session = Model.extractCiSession(out)
     var errText = Model.loginErrorFromHtml(out)
@@ -463,9 +488,15 @@ Panel {
     loginStatus = "Signed in as " + username + ", loading your lists..."
   }
 
-  function finishWhoami() {
+  function finishWhoami(exitCode) {
     whoamiWatchdog.stop()
     signingIn = false
+    // Byte cap tripped: the profile page is truncated - the user id may be
+    // missing or mangled, so refuse the sign-in commit.
+    if (Model.isSizeOverflow(exitCode)) {
+      loginStatus = "Could not confirm the session - the profile page came back oversized. Try again."
+      return
+    }
     var uid = Model.extractProfileUserId(whoamiStdout.text)
     if (uid <= 0) {
       loginStatus = "Could not find a profile for that name. Check the spelling and try again."
@@ -515,8 +546,8 @@ Panel {
       waitForEnd: true
     }
 
-    onExited: function() {
-      Qt.callLater(function() { root.finishSignIn(root.pendingName) })
+    onExited: function(exitCode) {
+      Qt.callLater(function() { root.finishSignIn(root.pendingName, exitCode) })
     }
   }
 
@@ -541,8 +572,8 @@ Panel {
       waitForEnd: true
     }
 
-    onExited: function() {
-      Qt.callLater(function() { root.finishWhoami() })
+    onExited: function(exitCode) {
+      Qt.callLater(function() { root.finishWhoami(exitCode) })
     }
   }
 
